@@ -65,6 +65,7 @@ from benchmark_proxy import (
     DEFAULT_BENCHMARK,
 )
 import mis_history
+import model_portfolio
 from ui_theme import render_section_header, render_info_card, finance_panel
 
 # ─── Default Sample Portfolio ──────────────────────────────────────────────────
@@ -1824,7 +1825,14 @@ def _render_block(block: Dict[str, Any], key: str):
                 )
 
 
+# The model-portfolio history file is the default source: it is the only one
+# that knows what the portfolio actually looked like before the current
+# rebalance. "Auto" is kept for in-session edits, but it starts as a copy of the
+# current portfolio, which is why it used to show the current portfolio twice.
+_PREV_MODE_HISTORY = "Model Portfolio History"
+
 _PREV_MODES = [
+    _PREV_MODE_HISTORY,
     "Auto (carry over previous version)",
     "Manual Entry / Edit",
     "Upload Excel File",
@@ -1865,8 +1873,18 @@ def render_mis_generator_page():
             st.session_state["mis_auto_prev_df"] = saved["auto_previous"]
         # Seed the radio's key before the widget exists so the saved choice is
         # what renders; setting it afterwards would be ignored for this run.
-        if saved["prev_mode"] in _PREV_MODES:
-            st.session_state["mis_prev_mode"] = saved["prev_mode"]
+        _saved_mode = saved["prev_mode"]
+        if _saved_mode in _PREV_MODES:
+            # One-time migration. A workspace saved before the history source
+            # existed carries prev_mode="Auto ...", and its carry-over is a copy
+            # of the current portfolio -- the bug itself. Only a workspace
+            # actually in that state is moved across, so a deliberate choice of
+            # Auto that holds a genuinely different portfolio is left alone.
+            _stuck = (
+                _saved_mode.startswith("Auto")
+                and model_portfolio.same_holdings(saved["auto_previous"], saved["current"])
+            )
+            st.session_state["mis_prev_mode"] = _PREV_MODE_HISTORY if _stuck else _saved_mode
         st.session_state["mis_workspace_restored_at"] = saved["saved_at"]
         st.session_state["mis_workspace_loaded"] = True
 
@@ -1996,7 +2014,50 @@ def render_mis_generator_page():
 
         auto_prev = st.session_state.get("mis_auto_prev_df")
 
-        if prev_mode == "Auto (carry over previous version)":
+        if prev_mode == _PREV_MODE_HISTORY:
+            hist = model_portfolio.previous_portfolio(current_portfolio_df)
+            if hist is None:
+                st.warning(
+                    "No earlier portfolio found in the model portfolio history file. "
+                    "Check that **Model Port data.xlsx** sits next to the app, or pick "
+                    "another source above."
+                )
+                prev_raw = pd.DataFrame(columns=["Scheme Name", "ISIN", "Allocation (%)", "Benchmark"])
+            else:
+                st.success(
+                    f"Previous model portfolio — **{hist.label}** · {len(hist.frame)} schemes, "
+                    f"read from the rebalance history file."
+                )
+                # Name what changed. This is the whole point of the second block,
+                # and it is also the quickest way to see that it is genuinely a
+                # different portfolio and not a copy of the current one.
+                cur_isins = set(str(i).strip().upper() for i in current_portfolio_df.get("ISIN", []))
+                prev_isins = set(hist.frame["ISIN"])
+                exited = sorted(prev_isins - cur_isins)
+                entered = sorted(cur_isins - prev_isins)
+                if exited or entered:
+                    names = dict(zip(hist.frame["ISIN"], hist.frame["Scheme Name"]))
+                    bits = []
+                    if exited:
+                        bits.append("**Exited since:** " + ", ".join(names.get(i, i) for i in exited))
+                    if entered:
+                        cur_names = dict(zip(
+                            current_portfolio_df.get("ISIN", []),
+                            current_portfolio_df.get("Scheme Name", []),
+                        ))
+                        bits.append("**Added since:** " + ", ".join(str(cur_names.get(i, i)) for i in entered))
+                    st.caption(" · ".join(bits))
+
+                if hist.unmapped:
+                    st.warning(
+                        "No benchmark on file for: " + ", ".join(hist.unmapped) +
+                        ". Add them to `scheme_benchmarks.json`, or those rows fall back "
+                        "to " + DEFAULT_BENCHMARK + "."
+                    )
+                st.dataframe(hist.frame, use_container_width=True, hide_index=True)
+                prev_raw = hist.frame
+
+        elif prev_mode == "Auto (carry over previous version)":
             if auto_prev is not None and not auto_prev.empty:
                 unchanged = _portfolio_signature(auto_prev) == _portfolio_signature(current_portfolio_df)
                 if unchanged:
@@ -2071,7 +2132,14 @@ def render_mis_generator_page():
         _pdisk = mis_history.load_workspace()
         _pstored = _pdisk["auto_previous"] if prev_mode.startswith("Auto") else _pdisk["previous"]
 
-        if _prev_sig == ():
+        if prev_mode == _PREV_MODE_HISTORY:
+            # Nothing to persist: this block is read from the workbook that ships
+            # with the app, so it is already the same after any refresh.
+            st.caption(
+                "📖 Read from **Model Port data.xlsx** — no saving needed, it is the "
+                "same after every refresh and restart."
+            )
+        elif _prev_sig == ():
             st.caption("Nothing to save — the previous portfolio is empty.")
         elif _pstored is None:
             st.caption("⚠️ Nothing saved to disk yet — this previous portfolio will not survive a reload.")

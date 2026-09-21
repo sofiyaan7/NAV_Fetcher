@@ -189,64 +189,6 @@ html, body, [class*="css"] {
     100% { box-shadow: 0 0 0 0 rgba(0, 230, 118, 0); }
 }
 
-/* ── Live Ticker Strip ── */
-.ticker-strip {
-    display: flex;
-    overflow: hidden;
-    gap: 0;
-    margin-bottom: 1.5rem;
-    background: rgba(4, 7, 17, 0.85);
-    backdrop-filter: blur(12px);
-    border: 1px solid var(--border-faint);
-    border-radius: var(--radius-md);
-    padding: 0.6rem 0;
-    mask-image: linear-gradient(90deg, transparent, black 6%, black 94%, transparent);
-}
-.ticker-track {
-    display: flex;
-    gap: 2.5rem;
-    animation: ticker-scroll 45s linear infinite;
-    white-space: nowrap;
-    padding: 0 1.5rem;
-}
-.ticker-item {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.6rem;
-    font-size: 0.82rem;
-    color: var(--text-secondary);
-}
-.ticker-symbol {
-    font-family: 'IBM Plex Mono', monospace;
-    font-weight: 600;
-    color: var(--text-primary);
-}
-.ticker-change.up {
-    color: var(--gain);
-    background: var(--gain-soft);
-    padding: 0.15rem 0.4rem;
-    border-radius: var(--radius-sm);
-    font-family: 'JetBrains Mono', 'IBM Plex Mono', monospace;
-    font-weight: 500;
-    font-size: 0.78rem;
-    border: 1px solid rgba(0, 230, 118, 0.15);
-}
-.ticker-change.down {
-    color: var(--loss);
-    background: var(--loss-soft);
-    padding: 0.15rem 0.4rem;
-    border-radius: var(--radius-sm);
-    font-family: 'JetBrains Mono', 'IBM Plex Mono', monospace;
-    font-weight: 500;
-    font-size: 0.78rem;
-    border: 1px solid rgba(255, 51, 102, 0.15);
-}
-.ticker-sep { color: var(--border-subtle); margin-left: 0.25rem;}
-@keyframes ticker-scroll {
-    0% { transform: translateX(0); }
-    100% { transform: translateX(-50%); }
-}
-
 /* ── Workstation Hero Card ── */
 .hero-card {
     background: var(--bg-panel);
@@ -866,31 +808,6 @@ def render_top_bar() -> None:
             </div>
         </div>
         """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_ticker_strip() -> None:
-    items = [
-        ('NIFTY 50', '24,835.40', '▲ +0.42%', 'up'),
-        ('SENSEX', '81,482.10', '▲ +0.38%', 'up'),
-        ('NIFTY MIDCAP', '56,210.60', '▼ -0.12%', 'down'),
-        ('GOLD 24K', '₹72,450', '▲ +0.18%', 'up'),
-        ('USD/INR', '83.42', '▼ -0.05%', 'down'),
-        ('AMFI FEED', 'Updated', 'ONLINE', 'up'),
-    ]
-    ticker_html = ""
-    for symbol, price, change, direction in items * 2:
-        ticker_html += (
-            f'<span class="ticker-item">'
-            f'<span class="ticker-symbol">{symbol}</span>'
-            f'<span>{price}</span>'
-            f'<span class="ticker-change {direction}">{change}</span>'
-            f'<span class="ticker-sep">|</span>'
-            f'</span>'
-        )
-    st.markdown(
-        f'<div class="ticker-strip"><div class="ticker-track">{ticker_html}</div></div>',
         unsafe_allow_html=True,
     )
 

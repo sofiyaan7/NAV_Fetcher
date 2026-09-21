@@ -1039,7 +1039,6 @@ from ui_theme import (
     render_hero,
     render_info_card,
     render_section_header,
-    render_ticker_strip,
     render_top_bar,
 )
 
@@ -1405,7 +1404,6 @@ def main() -> None:
 
     latest_update = format_timestamp(nav_data)
     scheme_count = len(nav_data) if not nav_data.empty else 0
-    render_ticker_strip()
     render_hero(
         title="Mutual Fund NAV Terminal",
         subtitle=(

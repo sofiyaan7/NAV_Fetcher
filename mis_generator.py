@@ -490,48 +490,10 @@ def build_nav_series(df_nav_raw: pd.DataFrame, isin_list: List[str]) -> Dict[str
 
 # ─── Flows ────────────────────────────────────────────────────────────────────
 
-# Quant publishes its AUM a day ahead of the rest of the industry, so the usual
-# pairing measures the wrong interval for their schemes. AMFI names every one of
-# their schemes 'quant <fund>', so a prefix test is enough and will not catch an
-# unrelated fund with 'quant' elsewhere in its name.
-
-
-def _align_quant_nav(df_aum: pd.DataFrame) -> pd.DataFrame:
-    """Pair Quant AMC's AUM with the return that actually spans it.
-
-    Quant publishes AUM a day ahead of the rest of the industry: the figure
-    stamped for day D already reflects day D+1's book. The flow formula
-    AUM_t - AUM_(t-1) * (1 + return) then charges the wrong day's
-    mark-to-market against the pair, which is why Quant Large Cap reported a
-    51.15cr flow where the reference shows 2.04.
-
-    Taking the reported AUM as the previous day's and the next day's as the
-    current one -- with the return otherwise normal -- is the same as pairing
-    the unchanged AUM column with the *preceding* day's return. Shifting the
-    NAV column forward one observation does exactly that, and leaves the AUM
-    figures themselves untouched. Other AMCs are unaffected.
-    """
-    if df_aum.empty or "NAV" not in df_aum.columns or "Scheme Name" not in df_aum.columns:
-        return df_aum
-
-    is_quant = df_aum["Scheme Name"].astype(str).str.lower().str.startswith("quant")
-    if not is_quant.any():
-        return df_aum
-
-    date_col = "NAV Date" if "NAV Date" in df_aum.columns else None
-    if date_col is None:
-        return df_aum
-
-    out = df_aum.copy()
-    for _isin, grp in out[is_quant].groupby("ISIN Div Payout / ISIN Growth"):
-        grp = grp.sort_values(date_col)
-        shifted = grp["NAV"].shift(1)
-        # The first observation has no predecessor; keep its own NAV so the
-        # opening day is simply not counted rather than becoming NaN.
-        shifted.iloc[0] = grp["NAV"].iloc[0]
-        out.loc[grp.index, "NAV"] = shifted.values
-
-    return out
+# quant AMC's one-day offset is applied in nav_fetcher: _shift_quant_aum pulls
+# their AUM series back one observation, and the NAV is left alone because their
+# NAVs are published like everyone else's. Both reports run through
+# calculate_flows_for_dataframe, so both get it.
 
 
 def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],

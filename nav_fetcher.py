@@ -433,15 +433,15 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
         try:
             parsed_date = datetime.strptime(date_str, "%d-%b-%Y")
             yesterday = datetime.today() - timedelta(days=1)
-            if parsed_date < yesterday:
+            file_age = time.time() - os.path.getmtime(cache_path)
+            # Recent dates are re-read hourly: AMFI keeps filling in a day's AUM
+            # ('^' rows) for a couple of days after it first appears.
+            if parsed_date < datetime.today() - timedelta(days=4) or file_age < 3600:
                 with open(cache_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            else:
-                # 1 hour TTL for recent dates
-                file_age = time.time() - os.path.getmtime(cache_path)
-                if file_age < 3600:
-                    with open(cache_path, "r", encoding="utf-8") as f:
-                        return json.load(f)
+                    cached = json.load(f)
+                cached = [r for r in cached if not r.get("navDate") or r.get("navDate") == date_str]
+                if cached:
+                    return cached
         except Exception:
             pass
             
@@ -486,11 +486,19 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
                     if rows is None and res_data.get("validationMsg") == "SUCCESS":
                         rows = []
                     if isinstance(rows, list):
-                        try:
-                            with open(cache_path, "w", encoding="utf-8") as f:
-                                json.dump(rows, f)
-                        except Exception:
-                            pass
+                        # For a date it has not published yet (the feed runs a day
+                        # or two behind) AMFI answers with its latest older day.
+                        # Those rows are not this date's AUM: stamping them with
+                        # it made the next real figure look like a repeat.
+                        rows = [r for r in rows if not r.get("navDate") or r.get("navDate") == date_str]
+                        if rows:
+                            # An empty answer is never saved: an unpublished day
+                            # cached as [] would stay blank for good.
+                            try:
+                                with open(cache_path, "w", encoding="utf-8") as f:
+                                    json.dump(rows, f)
+                            except Exception:
+                                pass
                         return rows
             elif resp.status_code in (429, 503):
                 # Throttled — back off harder before retrying.
@@ -503,52 +511,6 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
             time.sleep(delay + random.uniform(0, 0.5))
             delay = min(delay * 2, 20)
 
-    return []
-
-
-def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id: int, subcategory_id: int) -> list:
-    key = (date_str, maturity_id, category_id, subcategory_id)
-    if key in API_CACHE:
-        return API_CACHE[key]
-        
-    url = "https://www.amfiindia.com/gateway/pollingsebi/api/amfi/fundperformance"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "maturityType": maturity_id,
-        "category": category_id,
-        "subCategory": subcategory_id,
-        "mfid": 0,
-        "reportDate": date_str
-    }
-    
-    import time
-    max_retries = 3
-    backoff = 1.0
-    
-    for attempt in range(max_retries):
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=20)
-            if resp.status_code == 200:
-                res_data = resp.json()
-                if res_data.get("validationMsg") == "SUCCESS":
-                    rows = res_data.get("data", [])
-                    API_CACHE[key] = rows
-                    return rows
-                else:
-                    print(f"AMFI API Validation failed for {key}: {res_data.get('validationMsg')}")
-            else:
-                print(f"AMFI API returned HTTP code {resp.status_code} for {key}")
-        except Exception as e:
-            print(f"Attempt {attempt+1} failed for {key} with error: {e}")
-        
-        if attempt < max_retries - 1:
-            time.sleep(backoff)
-            backoff *= 2
-            
-    API_CACHE[key] = []
     return []
 
 
@@ -667,53 +629,21 @@ def _find_by_nav(scheme_name: str, perf_rows: list,
     return hits[0] if len(hits) == 1 else None
 
 
-# quant AMC files a day's AUM against the following day. Their own pipeline
-# states it directly: previous AUM is the day's own reported figure and the
-# observed AUM is the next day's, with the NAV return left normal. Pulling
-# the series back one observation expresses exactly that, because the flow
-# engine then pairs AUM(D+1) against AUM(D) with return r(D).
+# AMCs that file each day's AUM one day late: the figure AMFI shows for day D
+# is the fund's AUM at the end of the previous NAV date. Measured on AMFI's own
+# data (Mar-Oct 2026): for 100% of Axis, JM Financial and quant schemes -- index
+# funds and ETFs included -- the AUM moves the day after the NAV; no other AMC
+# shows it. The AUM keeps its own date, and the flow formula strips the market
+# move with the NAVs one NAV date earlier (see calculate_flows_for_dataframe).
 #
-# Anchored at the start of the scheme name: the AMC name leads it and the NAV
-# frames carry no AMC column. Anchoring separates the AMC from everything
-# else containing the string -- Quantum is a different house, and Axis Quant
-# Fund and Aditya Birla Sun Life Quant Fund belong to Axis and ABSL. Checked
-# against the scheme index: 129 of 129 quant schemes matched, no false
-# positives.
-_QUANT_AMC = re.compile(r"^\s*quant\b", re.I)
+# Anchored at the start of the scheme name, where the AMC name sits; the NAV
+# frames carry no AMC column. Quantum is a different house, and Axis Quant Fund
+# is Axis -- "quant" must be the first word. JM's schemes start "JM ".
+_LAGGED_AMC = re.compile(r"^\s*(quant|axis|jm)\b", re.I)
 
 
-def _shift_quant_aum(df_res):
-    """Pull quant AMC's AUM back one observation per scheme.
-
-    Only a genuinely published figure may move: a carried or derived value
-    borrowed from tomorrow is not tomorrow's AUM. The final day has no
-    successor and is left empty rather than filled, so its flow is reported
-    as unmeasurable instead of invented.
-    """
-    if df_res.empty or "AUM" not in df_res.columns or "Scheme Name" not in df_res.columns:
-        return df_res
-    is_quant = df_res["Scheme Name"].astype(str).apply(lambda n: bool(_QUANT_AMC.match(n)))
-    if not is_quant.any():
-        return df_res
-    date_col = "NAV Date" if "NAV Date" in df_res.columns else (
-        "Date" if "Date" in df_res.columns else None)
-    if date_col is None:
-        return df_res
-    key_col = "Scheme Code" if "Scheme Code" in df_res.columns else "Scheme Name"
-
-    out = df_res.copy()
-    live = out["_aum_live"] if "_aum_live" in out.columns else None
-    source = out["AUM"].where(live.astype(bool)) if live is not None else out["AUM"]
-    order = parse_amfi_date_series(out[date_col])
-    moved = 0
-    for _key, grp_idx in out[is_quant].groupby(out.loc[is_quant, key_col]).groups.items():
-        idx = list(grp_idx)
-        idx.sort(key=lambda i: (order.loc[i] is pd.NaT, order.loc[i]))
-        out.loc[idx, "AUM"] = source.loc[idx].shift(-1).values
-        moved += len(idx)
-    if moved:
-        print(f"quant AMC: AUM realigned one day on {moved} row(s).")
-    return out
+def is_lagged_amc(scheme_name) -> bool:
+    return bool(_LAGGED_AMC.match(str(scheme_name or "")))
 
 
 def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool = True,
@@ -951,10 +881,17 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     nav_by_scheme_date: dict = {}
     try:
         _nav_col = "NAV" if "NAV" in df_res.columns else None
-        _dt_col = "NAV Date" if "NAV Date" in df_res.columns else None
+        # Fund Performance frames call it "Date", the MIS "NAV Date". Looking
+        # for "NAV Date" only meant the NAV check never ran in Fund Performance.
+        _dt_col = next((c for c in ("NAV Date", "Date") if c in df_res.columns), None)
         if _nav_col and _dt_col:
-            for _n, _d, _v in zip(df_res["Scheme Name"], df_res[_dt_col], df_res[_nav_col]):
-                if pd.isna(_v):
+            # The API's navRegular is the Regular plan's NAV. NAVAll names no
+            # longer carry the plan, so a Direct row under the same name would
+            # overwrite the Regular NAV it must be checked against.
+            _plans = (df_res["Plan Type"].astype(str).str.lower() if "Plan Type" in df_res.columns
+                      else pd.Series("", index=df_res.index))
+            for _n, _d, _v, _p in zip(df_res["Scheme Name"], df_res[_dt_col], df_res[_nav_col], _plans):
+                if pd.isna(_v) or "direct" in _p:
                     continue
                 _ds = str(_d).strip()
                 try:
@@ -1048,7 +985,8 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         for p_row in p_rows:
             p_name = p_row.get("schemeName")
             if p_name and p_name in needed_perf_names:
-                flat_perf_lookup[(date_str, asset_class, p_name)] = p_row.get("dailyAUM")
+                flat_perf_lookup[(date_str, asset_class, p_name)] = (
+                    p_row.get("dailyAUM"), str(p_row.get("specialCharAum") or "").strip())
     # Free the large perf_lookup dict — flat_perf_lookup is far smaller
     del perf_lookup
 
@@ -1071,11 +1009,13 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         
         perf_name = scheme_match_cache.get((scheme_name, asset_class))
         if perf_name:
-            daily_aum = flat_perf_lookup.get((date_str, asset_class, perf_name))
+            daily_aum, mark = flat_perf_lookup.get((date_str, asset_class, perf_name), (None, ""))
             if daily_aum is not None and daily_aum != "":
                 try:
                     aums[i] = float(daily_aum)
-                    live_flags[i] = True
+                    # '^' is AMFI's own marker for "AUM not updated today": the
+                    # previous figure repeated. Shown, but not a new observation.
+                    live_flags[i] = mark != "^"
                 except Exception:
                     pass
     
@@ -1111,8 +1051,10 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         except Exception:
             pass
 
-    df_res = _shift_quant_aum(df_res)
-    df_res = df_res.drop(columns=["_aum_live"], errors="ignore")
+    # _aum_live stays on the frame: calculate_flows_for_dataframe measures flows
+    # only between genuinely published AUMs, never against a carried, monthly
+    # fallback or '^' figure.
+    df_res["_aum_live"] = df_res["_aum_live"].fillna(False).astype(bool)
 
     # Record fetch health so the UI can flag when the live AMFI feed under-delivered.
     total_rows = len(df_res)
@@ -1139,13 +1081,49 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
 
 
 # A daily NAV move smaller than this cannot distinguish a stale AUM from a
-# genuinely flat one, so staleness is only called above it.
+# genuinely flat one, so staleness is only called above it. (Kept for the MIS
+# notes; the flow engine treats any exactly repeated AUM as not updated.)
 STALE_AUM_MIN_MOVE_PCT = 0.05
+
+# A scheme missing from AMFI's list (no NAV that day, mostly overseas holdings)
+# or repeating its AUM is bridged for up to this many calendar days.
+MAX_BRIDGE_DAYS = 14
+# An active fund's one-day flow above this share of its AUM is a data error.
+MAX_SCHEME_FLOW_SHARE = 0.25
+# Typical scheme flow beyond this % of AUM on a day = AUM out of sync with NAV.
+MAX_MEDIAN_FLOW_PCT = 0.5
+# Notes from the last calculate_flows_for_dataframe run, for the UI / MIS.
+_LAST_FLOW_NOTES: list = []
+
+
+def _out_of_sync_days(df, live, is_index):
+    """Dates on which the typical active scheme's one-day flow exceeds
+    MAX_MEDIAN_FLOW_PCT of its AUM -- AMFI's AUMs not moving with the NAVs.
+    Needs a broad frame (at least 50 schemes on the day) to judge."""
+    rows = df[live & ~is_index & df["_flow_nav"].notna()][["Scheme Code", "NAV Date_parsed", "AUM", "_flow_nav"]]
+    if rows["Scheme Code"].nunique() < 50:
+        return set()
+    rows = rows.sort_values(["Scheme Code", "NAV Date_parsed"])
+    g = rows.groupby("Scheme Code")
+    prev_aum, prev_nav = g["AUM"].shift(1), g["_flow_nav"].shift(1)
+    rel = (rows["AUM"] - prev_aum * rows["_flow_nav"] / prev_nav) / prev_aum * 100
+    rel = rel[(prev_aum > 100) & (rows["AUM"] != prev_aum)]
+    per_day = rel.groupby(rows.loc[rel.index, "NAV Date_parsed"])
+    return {d for d, v in per_day if len(v) >= 50 and abs(v.median()) > MAX_MEDIAN_FLOW_PCT}
 
 
 def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list) -> pd.DataFrame:
-    """Calculate the flows format columns for a vertical Mutual Fund DataFrame."""
+    """Calculate the flows format columns for a vertical Mutual Fund DataFrame.
+
+    Net flow = AUM - previous published AUM x NAV end / NAV start, i.e. the AUM
+    change left after removing the market move. Only AUMs AMFI genuinely
+    published for the day count (not '^' repeats, carried or fallback figures);
+    the days between two published AUMs book no flow, and the later one carries
+    the whole movement with the NAV pair spanning the gap. Axis, JM and quant
+    use NAVs one NAV date earlier because they file AUM a day late.
+    """
     df = df.copy()
+    _LAST_FLOW_NOTES.clear()
     
     # Standardize columns
     if "NAV" not in df.columns and "NAVs" in df.columns:
@@ -1175,89 +1153,84 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
 
     df = df.sort_values(by=["Scheme Code", "NAV Date_parsed"]).reset_index(drop=True)
 
-    # The return the flow formula charges against a day's AUM pair always comes
-    # from that day's own NAV, for every AMC including quant. quant's one-day
-    # offset is a property of their AUM filing, not of their NAV: their NAVs are
-    # published exactly like everyone else's, and _shift_quant_aum has already
-    # expressed the offset by pulling the AUM series back one observation.
-    # Shifting the NAV as well applied the same correction twice.
-    df["_flow_nav"] = df["NAV"]
+    # Which rows carry a genuinely published AUM. populate_actual_aum flags them;
+    # a frame from elsewhere (no flag) treats every non-blank AUM as published.
+    if "_aum_live" in df.columns:
+        live = df["_aum_live"].fillna(False).astype(bool)
+    else:
+        live = df["AUM"].notna()
+    live &= df["AUM"].notna() & (df["AUM"] != 0)
+
+    # Axis, JM and quant file AUM a day late: strip the market move with the NAV
+    # of the previous NAV date. Everyone else: the day's own NAV.
+    lagged = df["Scheme Name"].apply(is_lagged_amc) if "Scheme Name" in df.columns else pd.Series(False, index=df.index)
+    prev_nav = df.groupby("Scheme Code")["NAV"].shift(1)
+    df["_flow_nav"] = df["NAV"].where(~lagged, prev_nav)
+
+    is_index = df["Asset Class"].astype(str).str.contains(r"Index|ETF|Other Scheme", case=False, regex=True) \
+        if "Asset Class" in df.columns else pd.Series(False, index=df.index)
+
+    # Day-level check: on a day AMFI's AUMs did not move with the NAVs (it
+    # happened across the 31-Mar/1-Apr year change), nearly every active scheme
+    # shows an outflow of 1-2% of AUM. A normal day's typical scheme moves
+    # ~0.01%. Such a day's AUMs are not used; the next day measures across it.
+    bad_days = _out_of_sync_days(df, live, is_index)
+    if bad_days:
+        live &= ~df["NAV Date_parsed"].isin(bad_days)
+        _LAST_FLOW_NOTES.append(
+            "AMFI's AUM did not move with NAV on " + ", ".join(d.strftime("%d-%b-%Y") for d in sorted(bad_days))
+            + "; those days' AUMs were not used and their flows fall on the next day.")
 
     df["Closing AUM as on previous day"] = None
     df["Actual AUM as on current date"] = df["AUM"]
     df["Daily return"] = None
     df["Derived AUM as on curent day"] = None
     df["Net flows on current day"] = None
-    
+
+    implausible = []
     for scheme_code, group in df.groupby("Scheme Code"):
-        indices = group.index
-        # AUM carried forward for the next day's baseline. On a stale or missing
-        # day this holds the mark-to-market value rather than the repeated one,
-        # so the following day is measured against where the fund actually was.
-        # Zeroing the stale day alone would just push its error onto the next.
-        eff_prev = None
-        for idx_in_group, idx in enumerate(indices):
-            if idx_in_group == 0:
-                eff_prev = df.at[idx, "AUM"]
+        anchor = None  # (index, AUM, flow NAV, date) of the last published AUM
+        for idx in group.index:
+            date_i = df.at[idx, "NAV Date_parsed"]
+            aum_i = df.at[idx, "AUM"]
+            nav_i = df.at[idx, "_flow_nav"]
+            valid = bool(live.at[idx]) and pd.notna(nav_i) and nav_i != 0
+            if anchor is not None and pd.notna(date_i) and pd.notna(anchor[3]) \
+                    and (date_i - anchor[3]).days > MAX_BRIDGE_DAYS:
+                anchor = None  # absent too long to compare reliably
+
+            if anchor is not None:
+                df.at[idx, "Closing AUM as on previous day"] = anchor[1]
+            if anchor is None or not valid or float(aum_i) == float(anchor[1]):
+                # No new published AUM since the anchor: AMFI repeated it ('^'),
+                # left the scheme out, or it is carried/fallback. Book no flow;
+                # the next published AUM covers these days, with the market move
+                # of all of them removed (its NAV pair spans the gap).
+                df.at[idx, "Net flows on current day"] = 0.0 if anchor is not None else None
+                if anchor is None and valid:
+                    anchor = (idx, float(aum_i), float(nav_i), date_i)
                 continue
-            prev_idx = indices[idx_in_group - 1]
-            
-            nav_curr = df.at[idx, "_flow_nav"]
-            nav_prev = df.at[prev_idx, "_flow_nav"]
-            aum_prev = eff_prev if eff_prev is not None and pd.notna(eff_prev) else df.at[prev_idx, "AUM"]
-            aum_curr = df.at[idx, "AUM"]
-            
-            df.at[idx, "Closing AUM as on previous day"] = aum_prev
-            
-            if pd.notna(nav_curr) and pd.notna(nav_prev) and nav_prev != 0:
-                daily_return = (nav_curr - nav_prev) / nav_prev
-                df.at[idx, "Daily return"] = daily_return * 100
-            else:
-                daily_return = None
-                
-            if pd.notna(aum_prev) and daily_return is not None:
-                derived_aum = aum_prev * (1 + daily_return)
-                df.at[idx, "Derived AUM as on curent day"] = derived_aum
-            else:
-                derived_aum = None
-                
-            # AMFI does not always publish a fresh AUM. When it repeats the
-            # previous day's figure verbatim while the NAV has moved, the AUM
-            # is stale rather than genuinely flat: an unchanged AUM against a
-            # moved NAV is arithmetically impossible. Charging the whole
-            # mark-to-market move as a subscription is how a 69,849cr AUM
-            # served twice produced a 913cr phantom flow, so book zero and let
-            # the next real AUM pick the movement up.
-            aum_unchanged = (
-                pd.notna(aum_prev) and pd.notna(aum_curr)
-                and float(aum_prev) == float(aum_curr)
-                and daily_return is not None
-                and abs(daily_return * 100) > STALE_AUM_MIN_MOVE_PCT
-            )
 
-            # A zero previous-day AUM cannot anchor a flow. The formula would
-            # measure the whole of today's AUM as a subscription -- a fund with
-            # 3,500cr and no published AUM yesterday would report a 3,500cr
-            # inflow. Zero here means "not reported", not "the fund was empty".
-            prev_is_zero = pd.notna(aum_prev) and float(aum_prev) == 0.0
-            curr_is_zero = pd.notna(aum_curr) and float(aum_curr) == 0.0
-
-            unmeasurable = curr_is_zero or prev_is_zero or aum_unchanged or derived_aum is None                 or pd.isna(aum_curr)
-
-            if unmeasurable:
-                # No usable AUM movement to attribute: report no flow. The
-                # baseline stays the published figure, so the next day measures
-                # against it and picks the missed movement up.
+            growth = float(nav_i) / anchor[2]
+            derived = anchor[1] * growth
+            flow = float(aum_i) - derived
+            df.at[idx, "Daily return"] = (growth - 1) * 100
+            df.at[idx, "Derived AUM as on curent day"] = derived
+            if not is_index.at[idx] and abs(flow) > MAX_SCHEME_FLOW_SHARE * anchor[1]:
+                # A one-day flow above a quarter of an active fund's AUM is a
+                # merger or a bad figure in AMFI's feed (e.g. DSP Value Fund
+                # shown at 5,237cr instead of ~1,760cr on 16 days). Not booked.
                 df.at[idx, "Net flows on current day"] = 0.0
-                eff_prev = aum_curr if (pd.notna(aum_curr) and float(aum_curr) != 0.0) else eff_prev
+                implausible.append(f"{df.at[idx, 'Scheme Name']} {df.at[idx, 'NAV Date']} ({flow:,.0f}cr)")
             else:
-                # A day following a stale one carries both days' movement. It is
-                # reported here rather than discarded: the alternative loses the
-                # flow entirely, and MTD and YTD then understate by whatever
-                # moved while AMFI was not updating.
-                df.at[idx, "Net flows on current day"] = aum_curr - derived_aum
-                eff_prev = aum_curr
+                df.at[idx, "Net flows on current day"] = flow
+            anchor = (idx, float(aum_i), float(nav_i), date_i)
 
+    if implausible:
+        _LAST_FLOW_NOTES.append(
+            f"{len(implausible)} one-day flow(s) above {MAX_SCHEME_FLOW_SHARE:.0%} of the scheme's AUM were "
+            "treated as AMFI data errors and not booked: " + "; ".join(implausible[:5])
+            + (" ..." if len(implausible) > 5 else ""))
 
     # Filter only target dates
     start_date_ts = pd.to_datetime(start_date)
@@ -1375,17 +1348,34 @@ def fetch_latest_navs(isin_list: List[str]) -> dict:
     except Exception:
         return {}
 
+    # Columns by header name: AMFI inserted Plan and Option before the NAV, so
+    # the old fixed positions read "Plan" as the NAV and matched nothing.
+    col = {"isin_g": 1, "isin_r": 2, "name": 3, "nav": 4, "date": 5}
     result = {}
     for line_bytes in resp.text.splitlines():
         line = line_bytes.strip()
-        if ";" not in line or line.startswith("Scheme Code"):
+        if ";" not in line:
             continue
         parts = [p.strip() for p in line.split(";")]
-        if len(parts) < 6:
+        if parts[0].lower().startswith("scheme code"):
+            low = [p.lower() for p in parts]
+            for i, h in enumerate(low):
+                if "isin" in h and ("growth" in h or "payout" in h):
+                    col["isin_g"] = i
+                elif "isin" in h and "reinvest" in h:
+                    col["isin_r"] = i
+                elif h == "scheme name":
+                    col["name"] = i
+                elif "asset value" in h or h == "nav":
+                    col["nav"] = i
+                elif h == "date":
+                    col["date"] = i
+            continue
+        if len(parts) <= max(col.values()):
             continue
 
-        isin_g = parts[1].upper() if parts[1] != "-" else ""
-        isin_r = parts[2].upper() if parts[2] != "-" else ""
+        isin_g = parts[col["isin_g"]].upper() if parts[col["isin_g"]] != "-" else ""
+        isin_r = parts[col["isin_r"]].upper() if parts[col["isin_r"]] != "-" else ""
         matched_isin = None
         if isin_g in isin_set:
             matched_isin = isin_g
@@ -1394,9 +1384,9 @@ def fetch_latest_navs(isin_list: List[str]) -> dict:
         else:
             continue
 
-        nav_val = pd.to_numeric(parts[4].replace(",", ""), errors="coerce")
-        nav_date = parts[5]  # e.g. "07-Jul-2026"
-        scheme_name = parts[3]
+        nav_val = pd.to_numeric(parts[col["nav"]].replace(",", ""), errors="coerce")
+        nav_date = parts[col["date"]]  # e.g. "07-Jul-2026"
+        scheme_name = parts[col["name"]]
 
         if pd.notna(nav_val) and matched_isin:
             result[matched_isin] = {

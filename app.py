@@ -498,11 +498,9 @@ def run_historical_export(
     if want_flows:
         fetch_start_date = start_date - timedelta(days=10)
 
-    # quant AMC files a day's AUM against the following day, so showing their
-    # figure for the last requested day means fetching past it. Without this the
-    # final row has no successor to draw from and falls back to a derived value:
-    # a 3,663cr fund reported 3,074cr on its most recent day.
-    fetch_end_date = end_date + timedelta(days=5)
+    # AUM keeps its own date for every AMC (the one-day-late filers are handled
+    # in the flow formula with the earlier NAV), so nothing past end_date is needed.
+    fetch_end_date = end_date
         
     try:
         # Determine if running inside Streamlit context
@@ -777,6 +775,12 @@ def run_historical_export(
             is_aum_only = False
             
         df_final = pd.merge(fund_metadata, df_pivot, on="Scheme Code", how="left")
+        if want_aum and "_aum_live" in df_raw.columns:
+            # Which AUMs AMFI actually published that day. Display AUM is carried
+            # and fallback-filled below; flows must only use the published ones.
+            df_pivot_live = df_raw.pivot(index="Scheme Code", columns="Date", values="_aum_live").reset_index()
+            df_pivot_live = df_pivot_live.rename(columns={d: f"{d}__live" for d in sorted_date_cols})
+            df_final = pd.merge(df_final, df_pivot_live, on="Scheme Code", how="left")
         del df_pivot  # free pivot memory
 
         if want_aum:
@@ -820,6 +824,8 @@ def run_historical_export(
                     r_item["NAV"] = row[f"{d} (NAV)"]
                     r_item["AUM Date"] = d
                     r_item["AUM"] = row[f"{d} (AUM)"]
+                if want_aum:
+                    r_item["_aum_live"] = row.get(f"{d}__live") is True
                 vertical_rows.append(r_item)
 
         ordered_cols = [
@@ -834,7 +840,7 @@ def run_historical_export(
         if want_nav:
             ordered_cols.extend(["NAV Date", "NAV"])
         if want_aum:
-            ordered_cols.extend(["AUM Date", "AUM"])
+            ordered_cols.extend(["AUM Date", "AUM", "_aum_live"])
     
         del df_raw  # free the large intermediate frame before building vertical rows
         
@@ -851,7 +857,8 @@ def run_historical_export(
             # closed market. Nothing is lost: these rows never held a value.
             # Trim the extra days fetched for quant's one-day offset.
             try:
-                _d = parse_amfi_date_series(df_res_final["NAV Date"])
+                _dcol = "NAV Date" if "NAV Date" in df_res_final.columns else "AUM Date"
+                _d = parse_amfi_date_series(df_res_final[_dcol])
                 df_res_final = df_res_final[_d.dt.date <= _requested_end].reset_index(drop=True)
             except Exception:
                 pass
@@ -868,6 +875,7 @@ def run_historical_export(
             if want_flows:
                 df_res_final = calculate_flows_for_dataframe(df_res_final, start_date, ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"])
                 is_aum_only = False
+            df_res_final = df_res_final.drop(columns=["_aum_live"], errors="ignore")
         else:
             df_res_final = pd.DataFrame(columns=ordered_cols)
 

@@ -41,6 +41,7 @@ from nav_fetcher import (
     populate_actual_aum,
     load_portfolio_aum_data,
     calculate_flows_for_dataframe,
+    _LAST_FLOW_NOTES,
     _parse_amfi_date_str,
 )
 from benchmark_proxy import (
@@ -490,10 +491,9 @@ def build_nav_series(df_nav_raw: pd.DataFrame, isin_list: List[str]) -> Dict[str
 
 # ─── Flows ────────────────────────────────────────────────────────────────────
 
-# quant AMC's one-day offset is applied in nav_fetcher: _shift_quant_aum pulls
-# their AUM series back one observation, and the NAV is left alone because their
-# NAVs are published like everyone else's. Both reports run through
-# calculate_flows_for_dataframe, so both get it.
+# The one-day-late AUM filers (Axis, JM, quant) are handled inside
+# calculate_flows_for_dataframe, which strips their market move with the NAV of
+# the previous NAV date. Both reports run through it, so both get it.
 
 
 def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
@@ -548,8 +548,9 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
     window_start = min(fy_start - timedelta(days=1), mtd_start)
     seed = [d for d in dates_present if d <= window_start]
     keep = {d for d in dates_present if d > window_start}
-    if seed:
-        keep.add(max(seed))
+    # Two seed days, not one: the one-day-late AUM filers (Axis, JM, quant)
+    # measure against the NAV one NAV date earlier than the AUM's own.
+    keep.update(sorted(seed)[-2:])
     if len(keep) < 2:
         return result, None, mtd_start
 
@@ -600,6 +601,7 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
 
     if notes is not None:
         notes.extend(partial)
+        notes.extend(_LAST_FLOW_NOTES)
 
     if df_flows.empty or "Net flows on current day" not in df_flows.columns:
         return result, flow_date, mtd_start

@@ -1883,12 +1883,15 @@ from ui_theme import (
 )
 
 # ─── Page config ─────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="AMFI NAV Fetcher",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+# app.py owns st.set_page_config. This module used to call it at import time,
+# and app.py imports this module (line ~1023) before making its own call, so on
+# a cold process the app's own set_page_config was the *second* command and the
+# whole page came back as StreamlitSetPageConfigMustBeFirstCommandError. A
+# rerun hid it: the module is already in sys.modules by then and its top level
+# does not run again, so only the first visitor after a restart saw the error.
+#
+# Running `streamlit run nav_fetcher.py` still works -- main() below imports
+# app, and app's own call is then the first command on that path too.
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 AMFI_HISTORY_URL = (

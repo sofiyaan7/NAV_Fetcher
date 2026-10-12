@@ -1,0 +1,4 @@
+# The API serves the existing nav_fetcher / mis_generator logic over HTTP.
+# Install alongside the project's own requirements.txt.
+fastapi>=0.110
+uvicorn[standard]>=0.29

@@ -1,23 +1,25 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import FundSearch from "@/components/FundSearch";
-import FlowsTable from "@/components/FlowsTable";
-import PerformanceChart, { Point } from "@/components/PerformanceChart";
-import { Metrics, summarise } from "@/components/Metrics";
+import { Loader2 } from "lucide-react";
+import { SiteHeader } from "@/components/site-header";
+import { FundCombobox } from "@/components/fund-combobox";
+import { StatCards, summarise } from "@/components/stat-cards";
+import { NavFlowChart, Point } from "@/components/nav-flow-chart";
+import { DailyTable } from "@/components/daily-table";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { COL, Fund, Performance, fetchPerformance, num } from "@/lib/api";
 
 const iso = (d: Date) => d.toISOString().slice(0, 10);
-const monthsAgo = (n: number) => {
-  const d = new Date();
-  d.setMonth(d.getMonth() - n);
-  return d;
-};
+const monthsAgo = (n: number) => { const d = new Date(); d.setMonth(d.getMonth() - n); return d; };
 
-export default function Home() {
+export default function FundPerformancePage() {
   const [fund, setFund] = useState<Fund | null>(null);
-  // Set after mount: Next 16 refuses to prerender a component that reads the
-  // clock, because the built HTML would be stamped with the build date.
+  // Set after mount: Next refuses to prerender a component that reads the clock,
+  // because the built HTML would be stamped with the build date.
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [today, setToday] = useState("");
@@ -27,18 +29,16 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setStart(iso(monthsAgo(3)));
+    setStart(iso(monthsAgo(1)));
     setEnd(iso(new Date()));
     setToday(iso(new Date()));
   }, []);
 
-  const run = async (f: Fund | null = fund) => {
-    if (!f) return;
-    setBusy(true);
-    setError(null);
-    setData(null);
+  const run = async () => {
+    if (!fund) return;
+    setBusy(true); setError(null); setData(null);
     try {
-      setData(await fetchPerformance(f.isin, start, end, liveAum));
+      setData(await fetchPerformance(fund.isin, start, end, liveAum));
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -51,137 +51,117 @@ export default function Home() {
   const navs = rows.map((r) => num(r[COL.nav]));
   const aums = rows.map((r) => num(r[COL.aum]));
   const flows = rows.map((r) => num(r[COL.flow]));
-  const points: Point[] = rows.map((r, i) => ({
-    date: dates[i], nav: navs[i], flow: flows[i],
-  }));
+  const points: Point[] = rows.map((r, i) => ({ date: dates[i], nav: navs[i], flow: flows[i] }));
 
   return (
-    <main className="min-h-screen">
-      {/* Masthead. The search is the hero: naming a fund is the whole point. */}
-      <header className="bg-ink px-6 pb-10 pt-8 text-white">
-        <div className="mx-auto max-w-6xl">
-          <div className="flex items-baseline justify-between gap-4">
-            <div>
-              <h1 className="text-lg font-semibold tracking-tight">NAV Terminal</h1>
-              <p className="mt-0.5 text-sm text-white/55">
-                NAV, AUM and net flows for any Indian mutual fund — sourced from AMFI
-              </p>
-            </div>
-            <span className="hidden text-xs text-white/40 sm:block">AMFI · CRISIL feed</span>
+    <>
+      <SiteHeader breadcrumb={["Research", "Fund Performance"]} />
+
+      <main className="flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-7xl space-y-5 p-5">
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight">Fund Performance</h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              NAV, published AUM and net flows for a single scheme. One fund at a time, which is
+              what keeps a lookup to seconds.
+            </p>
           </div>
 
-          <div className="mt-7">
-            <FundSearch selected={fund} onSelect={(f) => { setFund(f); setData(null); setError(null); }} />
-          </div>
+          {/* Query bar */}
+          <Card>
+            <CardContent className="grid gap-3 px-5 py-5 lg:grid-cols-[minmax(0,1fr)_auto_auto_auto_auto] lg:items-end">
+              <div className="min-w-0">
+                <label className="mb-1.5 block text-xs text-muted-foreground">Fund</label>
+                <FundCombobox selected={fund} onSelect={(f) => { setFund(f); setData(null); setError(null); }} />
+              </div>
+              <div>
+                <label htmlFor="from" className="mb-1.5 block text-xs text-muted-foreground">From</label>
+                <Input id="from" type="date" value={start} max={end}
+                       onChange={(e) => setStart(e.target.value)} className="w-[9.5rem]" />
+              </div>
+              <div>
+                <label htmlFor="to" className="mb-1.5 block text-xs text-muted-foreground">To</label>
+                <Input id="to" type="date" value={end} min={start} max={today}
+                       onChange={(e) => setEnd(e.target.value)} className="w-[9.5rem]" />
+              </div>
+              <label className="flex h-9 items-center gap-2 text-sm">
+                <input type="checkbox" checked={liveAum} onChange={(e) => setLiveAum(e.target.checked)}
+                       className="size-4 accent-primary" />
+                <span>Published AUM</span>
+              </label>
+              <Button onClick={run} disabled={!fund || busy || !start || !end}>
+                {busy && <Loader2 className="animate-spin" />}
+                {busy ? "Fetching…" : "Run"}
+              </Button>
+            </CardContent>
+          </Card>
 
           {fund && (
-            <div className="mt-5 flex flex-wrap items-end gap-4">
-              <Field label="From">
-                <input type="date" value={start} max={end}
-                  onChange={(e) => setStart(e.target.value)} className={dateInput} />
-              </Field>
-              <Field label="To">
-                <input type="date" value={end} min={start} max={today}
-                  onChange={(e) => setEnd(e.target.value)} className={dateInput} />
-              </Field>
-              <label className="flex items-center gap-2 pb-2.5 text-sm text-white/70">
-                <input type="checkbox" checked={liveAum}
-                  onChange={(e) => setLiveAum(e.target.checked)}
-                  className="h-4 w-4 accent-white" />
-                Published AUM
-                <span className="text-xs text-white/35">(slower)</span>
-              </label>
-              <button type="button" onClick={() => run()} disabled={busy || !start || !end}
-                className="ml-auto rounded-lg bg-white px-6 py-2.5 text-sm font-semibold text-ink
-                           transition-opacity hover:opacity-90 disabled:opacity-50">
-                {busy ? "Fetching…" : "Get data"}
-              </button>
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <h2 className="text-lg font-semibold tracking-tight">{fund.scheme_name}</h2>
+              <p className="text-sm text-muted-foreground">
+                {fund.amc} · <span className="font-mono text-xs">{fund.isin}</span> ·{" "}
+                {fund.asset_class.replace(/^Open Ended Schemes\(|\)$/g, "")}
+              </p>
+            </div>
+          )}
+
+          {busy && <LoadingState />}
+
+          {error && (
+            <Card>
+              <CardContent className="px-5 py-5">
+                <p className="text-sm font-medium text-loss">Could not fetch that fund</p>
+                <p className="mt-1 text-sm text-muted-foreground">{error}</p>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  Try a shorter window, or clear <em>Published AUM</em> for a NAV-only run.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
+          {!fund && !busy && (
+            <Card className="border-dashed">
+              <CardContent className="px-5 py-14 text-center">
+                <p className="font-medium">Search for a fund to begin</p>
+                <p className="mx-auto mt-1.5 max-w-md text-sm text-muted-foreground">
+                  Start typing a scheme name above. The old page made you pick a whole category;
+                  naming one fund is what makes this quick.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
+          {data && !busy && (
+            <div className="space-y-5">
+              <StatCards stats={summarise(navs, aums, flows, dates)} />
+              <NavFlowChart data={points} />
+              <DailyTable rows={rows} />
+              {data.note && <p className="text-sm text-muted-foreground">Note from the fetcher: {data.note}</p>}
             </div>
           )}
         </div>
-      </header>
+      </main>
+    </>
+  );
+}
 
-      <div className="mx-auto max-w-6xl px-6 py-8">
-        {fund && (
-          <div className="mb-6">
-            <h2 className="text-2xl font-semibold tracking-tight">{fund.scheme_name}</h2>
-            <p className="mt-1 text-sm text-ink-muted">
-              {fund.amc} · <span className="figure">{fund.isin}</span> ·{" "}
-              {fund.asset_class.replace(/^Open Ended Schemes\(|\)$/g, "")}
-            </p>
-          </div>
-        )}
-
-        {busy && <Loading />}
-
-        {error && (
-          <div className="rounded-xl border border-rule bg-surface p-5">
-            <p className="font-medium text-loss">Could not fetch that fund</p>
-            <p className="mt-1 text-sm text-ink-muted">{error}</p>
-            <p className="mt-3 text-sm text-ink-faint">
-              The data service may be asleep or AMFI may be refusing requests. Try a shorter
-              window, or turn off <em>Published AUM</em> for a NAV-only run.
-            </p>
-          </div>
-        )}
-
-        {!fund && !busy && <EmptyState />}
-
-        {data && !busy && (
-          <div className="space-y-6">
-            <Metrics stats={summarise(navs, aums, flows, dates)} />
-            <PerformanceChart data={points} />
-            <FlowsTable rows={rows} />
-            {data.note && (
-              <p className="text-sm text-ink-muted">Note from the fetcher: {data.note}</p>
-            )}
-          </div>
-        )}
+function LoadingState() {
+  return (
+    <div className="space-y-5">
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-[6.5rem]" />)}
       </div>
-
-      <footer className="mx-auto max-w-6xl border-t border-rule px-6 py-6 text-xs text-ink-faint">
-        NAV from AMFI&rsquo;s daily file. AUM from AMFI&rsquo;s fund-performance disclosure
-        (operated by CRISIL), published about two days in arrears. Net flow removes the
-        market move from the AUM change.
-      </footer>
-    </main>
-  );
-}
-
-const dateInput =
-  "rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-sm text-white " +
-  "[color-scheme:dark] focus:border-white/35 focus:outline-none";
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="flex flex-col gap-1.5">
-      <span className="text-xs text-white/45">{label}</span>
-      {children}
-    </label>
-  );
-}
-
-function Loading() {
-  return (
-    <div className="rounded-xl border border-rule bg-surface p-8">
-      <div className="relative h-1 w-full overflow-hidden rounded bg-surface-sunk sweep" />
-      <p className="mt-5 text-sm font-medium text-ink">Fetching from AMFI…</p>
-      <p className="mt-1 text-sm text-ink-muted">
-        NAV history comes from AMFI&rsquo;s portal and usually takes ten to twenty seconds.
-        Published AUM adds a call per day on the first run, then answers from cache.
-      </p>
-    </div>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-xl border border-dashed border-rule-strong bg-surface px-8 py-14 text-center">
-      <p className="text-lg font-medium text-ink">Search for a fund to begin</p>
-      <p className="mx-auto mt-2 max-w-md text-sm text-ink-muted">
-        Start typing a scheme name above. One fund is fetched at a time, which is what keeps
-        a lookup to seconds rather than pulling a whole category.
-      </p>
+      <Card>
+        <CardContent className="px-5 py-5">
+          <Skeleton className="h-72 w-full" />
+          <p className="mt-4 text-sm text-muted-foreground">
+            Fetching from AMFI. NAV history comes from their portal and usually takes ten to
+            twenty seconds; published AUM adds a call per day on the first run, then answers
+            from cache.
+          </p>
+        </CardContent>
+      </Card>
     </div>
   );
 }

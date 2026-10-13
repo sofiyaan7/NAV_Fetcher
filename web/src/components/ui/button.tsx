@@ -32,7 +32,10 @@ function Button({
 }: React.ComponentProps<"button"> &
   VariantProps<typeof buttonVariants> & { asChild?: boolean }) {
   const Comp = asChild ? Slot : "button";
-  return <Comp className={cn(buttonVariants({ variant, size, className }))} {...props} />;
+  // A bare <button> defaults to type="submit", which would reload the page if one
+  // of these ever ends up inside a form. Callers can still override it.
+  const typeProp = asChild ? {} : { type: props.type ?? ("button" as const) };
+  return <Comp className={cn(buttonVariants({ variant, size, className }))} {...typeProp} {...props} />;
 }
 
 export { Button, buttonVariants };

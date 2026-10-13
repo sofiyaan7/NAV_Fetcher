@@ -272,3 +272,65 @@ export async function downloadMis(reportId: string, fmt: "xlsx" | "pdf") {
   const m = /filename="([^"]+)"/.exec(disp);
   saveBlob(await res.blob(), m ? m[1] : `MIS_Report.${fmt}`);
 }
+
+// ─── Fund Performance by category ────────────────────────────────────────────
+
+export const MATURITY_TYPES = ["Open Ended", "Close Ended", "Interval"] as const;
+export const CATEGORIES = ["Equity", "Debt", "Hybrid", "Solution Oriented", "Other"] as const;
+export const CATEGORY_IDS: Record<string, number> = {
+  Equity: 1, Debt: 2, Hybrid: 3, "Solution Oriented": 4, Other: 5,
+};
+
+export type Subcategory = { name: string; id: number };
+
+export const fetchSubcategories = (categoryId: number, signal?: AbortSignal) =>
+  get<{ source: string; subcategories: Subcategory[] }>(
+    `/subcategories?category_id=${categoryId}`, signal);
+
+export type CategoryOptions = {
+  maturity_type: string;
+  category: string;
+  subcategory_id: number | null;
+  start: string;
+  end: string;
+  carry_forward: boolean;
+  skip_saturdays: boolean;
+  skip_sundays: boolean;
+  want_nav: boolean;
+  want_aum: boolean;
+  want_flows: boolean;
+  fetch_live_aum: boolean;
+};
+
+export type CategoryResult = {
+  matched_scheme_rows: number;
+  regular_growth_funds: number;
+  excluded_direct: number;
+  excluded_options: number;
+  row_count: number;
+  columns: string[];
+  rows: PerformanceRow[];
+  note: string | null;
+};
+
+export async function fetchByCategory(
+  opts: CategoryOptions, signal?: AbortSignal,
+): Promise<CategoryResult> {
+  const res = await fetch(`${API_BASE}/performance/category`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+    signal,
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}

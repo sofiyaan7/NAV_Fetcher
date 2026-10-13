@@ -482,3 +482,99 @@ def mis_export(report_id: str, fmt: str = Query("xlsx", pattern="^(xlsx|pdf)$"))
         content=blob, media_type=media,
         headers={"Content-Disposition": f'attachment; filename="MIS_Report_{stamp}.{fmt}"'},
     )
+
+
+# ─── Fund Performance by category ─────────────────────────────────────────────
+#
+# The Streamlit page selects a *category*, resolves it to every matching scheme
+# and exports all of them. That is what made it slow, but it is also how you ask
+# "how did every large cap fund do", so both ways in are kept: this, and the
+# single-ISIN /performance above.
+
+MATURITY_IDS = {"Open Ended": 1, "Close Ended": 2, "Interval": 2}
+CATEGORY_IDS = {"Equity": 1, "Debt": 2, "Hybrid": 3, "Solution Oriented": 4, "Other": 5}
+
+
+@app.get("/subcategories")
+def subcategories(category_id: int = Query(..., ge=1, le=5)) -> dict:
+    """The Subcategory dropdown. Falls back to the last good answer, then to the
+    built-in SEBI list, so a failing AMFI endpoint makes the list stale rather
+    than empty."""
+    from app import load_subcategories
+
+    items, source = load_subcategories(category_id)
+    return {
+        "source": source,
+        "subcategories": [{"name": n, "id": i} for n, i in items if n],
+    }
+
+
+class CategoryRequest(BaseModel):
+    """The Fund Performance page's controls, one for one."""
+    maturity_type: str = "Open Ended"
+    category: str = "Equity"
+    subcategory_id: Optional[int] = None    # None means ALL
+    start: date
+    end: date
+    carry_forward: bool = True
+    skip_saturdays: bool = True
+    skip_sundays: bool = True
+    want_nav: bool = True
+    want_aum: bool = True
+    want_flows: bool = True
+    fetch_live_aum: bool = True
+
+
+def _isins_for_category(maturity_id: int, cat_id: int, sub_id) -> tuple:
+    """Every Regular Growth scheme in the chosen category, the way the page does it."""
+    df = _index()
+    keep = []
+    for _, row in df.iterrows():
+        m, c, s = map_section_to_ids(row.get("Asset Class", ""))
+        if m == maturity_id and c == cat_id and (sub_id is None or s == sub_id):
+            keep.append(row)
+    if not keep:
+        return [], 0, 0, 0
+    matched = pd.DataFrame(keep)
+    isins, n_kept, n_direct, n_option = select_regular_growth_isins(matched)
+    return isins, len(matched), n_direct, n_option
+
+
+@app.post("/performance/category")
+def performance_by_category(req: CategoryRequest) -> dict:
+    """The 'GO' button: NAV, AUM and flows for every scheme in a category.
+
+    This is the heavy path by nature -- Equity/ALL is 2,452 scheme rows -- so the
+    count it matched is reported alongside the rows.
+    """
+    if req.start > req.end:
+        raise HTTPException(400, "start must not be after end")
+    m_id = MATURITY_IDS.get(req.maturity_type)
+    c_id = CATEGORY_IDS.get(req.category)
+    if m_id is None or c_id is None:
+        raise HTTPException(400, "Unknown maturity type or category")
+
+    isins, matched_rows, n_direct, n_option = _isins_for_category(m_id, c_id, req.subcategory_id)
+    if not isins:
+        raise HTTPException(404, "No schemes in the AMFI index match that selection")
+
+    df, _aum_only, err = run_historical_export(
+        parsed_isins=list(isins), start_date=req.start, end_date=req.end,
+        carry_forward=req.carry_forward, skip_sundays=req.skip_sundays,
+        want_nav=req.want_nav, want_aum=req.want_aum, want_flows=req.want_flows,
+        fetch_live_aum=req.fetch_live_aum, skip_saturdays=req.skip_saturdays,
+    )
+    if df is None or df.empty:
+        raise HTTPException(404, err or "AMFI returned no rows for that selection")
+
+    clean = df.where(pd.notna(df), None)
+    return {
+        "matched_scheme_rows": matched_rows,
+        "regular_growth_funds": len(isins),
+        "excluded_direct": n_direct,
+        "excluded_options": n_option,
+        "row_count": len(clean),
+        "columns": [str(c) for c in clean.columns],
+        "rows": clean.to_dict(orient="records"),
+        "note": err,
+    }

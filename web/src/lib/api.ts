@@ -93,3 +93,77 @@ export const fmtCr = (v: number | null): string =>
 
 export const fmtPct = (v: number | null, dp = 2): string =>
   v === null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(dp)}%`;
+
+// ─── Historical ISIN export ──────────────────────────────────────────────────
+
+export type ExportOptions = {
+  isins: string[];
+  start: string;
+  end: string;
+  carry_forward: boolean;
+  skip_saturdays: boolean;
+  skip_sundays: boolean;
+  want_nav: boolean;
+  want_aum: boolean;
+  want_flows: boolean;
+  fetch_live_aum: boolean;
+};
+
+/** Posts the options and hands back the workbook, the way st.download_button did. */
+export async function exportHistorical(
+  opts: ExportOptions,
+  signal?: AbortSignal,
+): Promise<{ blob: Blob; filename: string; rows: string | null; note: string | null }> {
+  const res = await fetch(`${API_BASE}/export/historical`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+    signal,
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(detail);
+  }
+  const disp = res.headers.get("Content-Disposition") ?? "";
+  const match = /filename="([^"]+)"/.exec(disp);
+  return {
+    blob: await res.blob(),
+    filename: match ? match[1] : "nav_export.xlsx",
+    rows: res.headers.get("X-Row-Count"),
+    note: res.headers.get("X-Note") || null,
+  };
+}
+
+/** Hands a blob to the browser as a download. */
+export function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ─── AUM cache ───────────────────────────────────────────────────────────────
+
+export type AumCacheStats = {
+  files: number;
+  dates: number;
+  mb: number;
+  earliest: string | null;
+  latest: string | null;
+  sync_available: boolean;
+  sync_detail: string;
+  repo: string;
+};
+
+export const fetchAumCacheStats = (signal?: AbortSignal) =>
+  get<AumCacheStats>("/aum-cache/stats", signal);

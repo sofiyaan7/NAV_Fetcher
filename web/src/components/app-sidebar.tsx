@@ -13,7 +13,7 @@ const NAV = [
     label: "Research",
     items: [
       { href: "/", title: "Fund Performance", icon: LineChart, ready: true },
-      { href: "/historical-export", title: "Historical Export", icon: FileSpreadsheet, ready: false },
+      { href: "/historical-export", title: "Historical Export", icon: FileSpreadsheet, ready: true },
     ],
   },
   {
@@ -26,7 +26,7 @@ const NAV = [
   {
     label: "System",
     items: [
-      { href: "/aum-cache", title: "AUM Cache", icon: Database, ready: false },
+      { href: "/aum-cache", title: "AUM Cache", icon: Database, ready: true },
     ],
   },
 ];

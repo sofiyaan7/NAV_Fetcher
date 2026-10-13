@@ -31,7 +31,8 @@ from typing import List, Optional
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -51,8 +52,11 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],          # tighten to the Vercel domain before going live
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    # Without this the browser hides these from JS on a cross-origin response,
+    # so the download lands under a default name and the row count is lost.
+    expose_headers=["Content-Disposition", "X-Row-Count", "X-Note"],
 )
 
 ISIN_COL = "ISIN Div Payout/ ISIN Growth"
@@ -201,4 +205,85 @@ def categories() -> dict:
         "maturity": {"Open Ended": 1, "Close Ended": 2, "Interval": 2},
         "category": {"Equity": 1, "Debt": 2, "Hybrid": 3,
                      "Solution Oriented": 4, "Other": 5},
+    }
+
+
+# ─── Historical ISIN export ───────────────────────────────────────────────────
+
+class ExportRequest(BaseModel):
+    """Mirrors the Streamlit page's controls one for one."""
+    isins: List[str] = Field(..., min_length=1, description="Target ISINs")
+    start: date
+    end: date
+    carry_forward: bool = True          # Carry forward NAV on holidays/weekends
+    skip_saturdays: bool = True         # Skip Saturdays
+    skip_sundays: bool = True           # Skip Sundays
+    want_nav: bool = True               # Want NAV
+    want_aum: bool = True               # Want AUM
+    want_flows: bool = True             # Want Flows
+    fetch_live_aum: bool = True         # Fetch actual daily AUM from AMFI (slower)
+
+
+@app.post("/export/historical")
+def export_historical(req: ExportRequest) -> Response:
+    """The 'Fetch & generate Excel' button: a styled .xlsx for a list of ISINs.
+
+    Returns the workbook itself rather than JSON, so the browser can hand it
+    straight to a download the way st.download_button did.
+    """
+    if req.start > req.end:
+        raise HTTPException(400, "start must not be after end")
+
+    cleaned = [i.strip().upper() for i in req.isins if i and i.strip()]
+    if not cleaned:
+        raise HTTPException(400, "No usable ISINs were supplied")
+
+    df, is_aum_only, err = run_historical_export(
+        parsed_isins=cleaned, start_date=req.start, end_date=req.end,
+        carry_forward=req.carry_forward, skip_sundays=req.skip_sundays,
+        want_nav=req.want_nav, want_aum=req.want_aum, want_flows=req.want_flows,
+        fetch_live_aum=req.fetch_live_aum, skip_saturdays=req.skip_saturdays,
+    )
+    if df is None or df.empty:
+        raise HTTPException(404, err or "AMFI returned no rows for those ISINs and dates")
+
+    from nav_fetcher import build_date_cols, style_excel          # local: heavy import
+    date_cols = build_date_cols(req.start, req.end,
+                                skip_sunday=req.skip_sundays, skip_saturday=req.skip_saturdays)
+    present = [c for c in date_cols if c in df.columns] or [
+        c for c in df.columns if c not in ("Scheme Name", "ISIN Div Payout / ISIN Growth")]
+    try:
+        blob = style_excel(df, present, is_aum_only=is_aum_only)
+    except Exception as exc:                                       # pragma: no cover
+        raise HTTPException(500, f"Could not write the workbook: {exc}") from exc
+
+    stamp = f"{req.start:%Y%m%d}_{req.end:%Y%m%d}"
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="nav_export_{stamp}.xlsx"',
+                 "X-Row-Count": str(len(df)), "X-Note": err or ""},
+    )
+
+
+# ─── AUM cache ────────────────────────────────────────────────────────────────
+
+@app.get("/aum-cache/stats")
+def aum_cache_stats() -> dict:
+    """What the AUM Cache page reports: how much has been collected, and whether
+    the Hugging Face sync is even available on this machine."""
+    import aum_backfill
+    import aum_cache_sync
+
+    summary = aum_backfill.cache_summary()
+    ok, why = aum_cache_sync.available()
+    return {
+        "files": summary.get("files", 0),
+        "dates": summary.get("dates", 0),
+        "mb": summary.get("mb", 0),
+        "earliest": summary.get("earliest"),
+        "latest": summary.get("latest"),
+        "sync_available": ok,
+        "sync_detail": why,
+        "repo": aum_cache_sync.repo_id(),
     }

@@ -23,6 +23,8 @@ fix: one fund over the same window is ~190 rows.
 from __future__ import annotations
 
 import sys
+import uuid
+from collections import OrderedDict
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -287,3 +289,196 @@ def aum_cache_stats() -> dict:
         "sync_detail": why,
         "repo": aum_cache_sync.repo_id(),
     }
+
+
+# ─── MIS Generator ────────────────────────────────────────────────────────────
+#
+# Generating a pack costs an AMFI pass that can run into minutes, so a build is
+# done once and kept in memory under an id. The Excel and PDF endpoints then
+# write from that same result instead of fetching all over again, which is what
+# the Streamlit page got for free by holding it in session state.
+
+_MIS_RESULTS: "OrderedDict[str, dict]" = OrderedDict()
+_MIS_KEEP = 8
+
+
+def _remember(result: dict) -> str:
+    rid = uuid.uuid4().hex[:12]
+    _MIS_RESULTS[rid] = result
+    while len(_MIS_RESULTS) > _MIS_KEEP:
+        _MIS_RESULTS.popitem(last=False)
+    return rid
+
+
+def _recall(rid: str) -> dict:
+    data = _MIS_RESULTS.get(rid)
+    if data is None:
+        raise HTTPException(
+            404, "That report is no longer held in memory. Generate it again.")
+    return data
+
+
+class Holding(BaseModel):
+    scheme_name: str = Field(..., alias="Scheme Name")
+    isin: str = Field(..., alias="ISIN")
+    allocation: float = Field(..., alias="Allocation (%)")
+    benchmark: str = Field("", alias="Benchmark")
+
+    model_config = {"populate_by_name": True}
+
+
+class MisRequest(BaseModel):
+    """The MIS page's controls, one for one."""
+    portfolio: List[Holding]
+    previous_portfolio: Optional[List[Holding]] = None
+    start_date: date                       # Period Start Date
+    end_date: date                         # Report Date
+    include_flows: bool = False            # Include Flows column
+    since_inception: bool = False          # Measure new funds from inception
+    skip_saturdays: bool = True            # Skip Saturday / Sunday NAV marks
+    mis3_start: Optional[date] = None      # Use a separate date range for MIS 3
+    mis3_end: Optional[date] = None
+
+
+def _frame(rows: List[Holding]) -> "pd.DataFrame":
+    return pd.DataFrame([
+        {"Scheme Name": h.scheme_name, "ISIN": h.isin,
+         "Allocation (%)": h.allocation, "Benchmark": h.benchmark}
+        for h in rows
+    ])
+
+
+@app.get("/mis/default-portfolio")
+def mis_default_portfolio() -> dict:
+    """The sample template the 'Reset Sample Template' button restores."""
+    from mis_generator import DEFAULT_SAMPLE_PORTFOLIO
+    return {"portfolio": DEFAULT_SAMPLE_PORTFOLIO}
+
+
+@app.post("/mis/previous-portfolio")
+def mis_previous_portfolio(portfolio: List[Holding]) -> dict:
+    """The 'Model Portfolio History' source: the most recent rebalance that is
+    genuinely different from the portfolio supplied."""
+    import model_portfolio
+
+    block = model_portfolio.previous_portfolio(_frame(portfolio))
+    if block is None:
+        return {"found": False, "detail":
+                "No earlier portfolio in the rebalance history file.", "portfolio": []}
+    frame = block.frame.where(pd.notna(block.frame), None)
+    return {
+        "found": True,
+        "effective": block.effective.isoformat(),
+        "announced": block.announced.isoformat() if block.announced else None,
+        "label": block.label,
+        "unmapped": block.unmapped,
+        "portfolio": frame.to_dict(orient="records"),
+    }
+
+
+@app.post("/mis/generate")
+def mis_generate(req: MisRequest) -> dict:
+    """The 'Generate MIS Reports' button."""
+    from mis_generator import generate_mis_reports_data, validate_and_normalize_portfolio
+
+    if req.start_date > req.end_date:
+        raise HTTPException(400, "Period start must not be after the report date")
+
+    clean, warns, errs = validate_and_normalize_portfolio(_frame(req.portfolio))
+    if errs:
+        raise HTTPException(400, "; ".join(errs))
+
+    prev_clean = None
+    if req.previous_portfolio:
+        prev_clean, prev_warns, _ = validate_and_normalize_portfolio(_frame(req.previous_portfolio))
+        warns = list(warns) + [f"Previous portfolio: {w}" for w in prev_warns]
+        if prev_clean.empty:
+            prev_clean = None
+
+    try:
+        result = generate_mis_reports_data(
+            portfolio_df=clean,
+            start_date=req.start_date,
+            end_date=req.end_date,
+            previous_portfolio_df=prev_clean,
+            include_flows=req.include_flows,
+            skip_saturdays=req.skip_saturdays,
+            mis3_start=req.mis3_start,
+            mis3_end=req.mis3_end,
+            since_inception=req.since_inception,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"MIS build failed: {exc}") from exc
+
+    rid = _remember(result)
+
+    def tables(block) -> list:
+        """MIS 1, 2 and 3 as plain rows the browser can render.
+
+        A block is a dict carrying mis1/mis2/mis3 specs; each spec holds its
+        rows as a DataFrame plus the display headers the report prints, which
+        are not the same as the internal column names.
+        """
+        if not isinstance(block, dict):
+            return []
+        out = []
+        for key in ("mis1", "mis2", "mis3"):
+            spec = block.get(key)
+            if not isinstance(spec, dict):
+                continue
+            frame = spec.get("rows")
+            if frame is None or getattr(frame, "empty", True):
+                continue
+            safe = frame.where(pd.notna(frame), None)
+            headers = spec.get("headers") or {}
+            cols = [str(c) for c in (spec.get("columns") or safe.columns)]
+            out.append({
+                "key": key,
+                "title": str(spec.get("title", "")),
+                "columns": cols,
+                "headers": [str(headers.get(c, c)) for c in cols],
+                "rows": safe.to_dict(orient="records"),
+                "footers": [
+                    {"label": str(f.get("label", "")),
+                     "values": {str(k): (None if pd.isna(v) else v)
+                                for k, v in (f.get("values") or {}).items()}}
+                    for f in (spec.get("footers") or []) if isinstance(f, dict)
+                ],
+                "pct_cols": [str(c) for c in (spec.get("pct_cols") or [])],
+                "colour_cols": [str(c) for c in (spec.get("colour_cols") or [])],
+            })
+        return out
+
+    dates = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+             for k, v in (result.get("dates") or {}).items()}
+    bench = result.get("benchmark_report")
+    return {
+        "report_id": rid,
+        "dates": dates,
+        "warnings": list(warns) + list(result.get("warnings") or []),
+        "include_flows": bool(result.get("include_flows")),
+        "current": tables(result.get("current")),
+        "previous": tables(result.get("previous")),
+        "benchmarks": (bench.where(pd.notna(bench), None).to_dict(orient="records")
+                       if bench is not None and not getattr(bench, "empty", True) else []),
+    }
+
+
+@app.get("/mis/{report_id}/export")
+def mis_export(report_id: str, fmt: str = Query("xlsx", pattern="^(xlsx|pdf)$")) -> Response:
+    """The two download buttons, written from the held result."""
+    from mis_generator import export_mis_to_excel, export_mis_to_pdf
+
+    data = _recall(report_id)
+    try:
+        blob = export_mis_to_excel(data) if fmt == "xlsx" else export_mis_to_pdf(data)
+    except Exception as exc:
+        raise HTTPException(500, f"Could not write the {fmt.upper()}: {exc}") from exc
+
+    media = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+             if fmt == "xlsx" else "application/pdf")
+    stamp = datetime.now().strftime("%Y%m%d")
+    return Response(
+        content=blob, media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="MIS_Report_{stamp}.{fmt}"'},
+    )

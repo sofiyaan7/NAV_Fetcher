@@ -167,3 +167,108 @@ export type AumCacheStats = {
 
 export const fetchAumCacheStats = (signal?: AbortSignal) =>
   get<AumCacheStats>("/aum-cache/stats", signal);
+
+// ─── MIS Generator ───────────────────────────────────────────────────────────
+
+export type Holding = {
+  "Scheme Name": string;
+  ISIN: string;
+  "Allocation (%)": number;
+  Benchmark: string;
+};
+
+export type MisTable = {
+  key: string;
+  title: string;
+  columns: string[];
+  headers: string[];
+  rows: Record<string, string | number | null>[];
+  footers: { label: string; values: Record<string, number | null> }[];
+  pct_cols: string[];
+  colour_cols: string[];
+};
+
+export type MisResult = {
+  report_id: string;
+  dates: Record<string, string>;
+  warnings: string[];
+  include_flows: boolean;
+  current: MisTable[];
+  previous: MisTable[];
+  benchmarks: Record<string, string | number | null>[];
+};
+
+export type MisOptions = {
+  portfolio: Holding[];
+  previous_portfolio: Holding[] | null;
+  start_date: string;
+  end_date: string;
+  include_flows: boolean;
+  since_inception: boolean;
+  skip_saturdays: boolean;
+  mis3_start: string | null;
+  mis3_end: string | null;
+};
+
+export const fetchDefaultPortfolio = (signal?: AbortSignal) =>
+  get<{ portfolio: Holding[] }>("/mis/default-portfolio", signal);
+
+export type PreviousPortfolio = {
+  found: boolean;
+  detail?: string;
+  effective?: string;
+  announced?: string | null;
+  label?: string;
+  unmapped?: string[];
+  portfolio: Holding[];
+};
+
+export async function fetchPreviousPortfolio(
+  portfolio: Holding[], signal?: AbortSignal,
+): Promise<PreviousPortfolio> {
+  const res = await fetch(`${API_BASE}/mis/previous-portfolio`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(portfolio),
+    signal,
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+export async function generateMis(opts: MisOptions, signal?: AbortSignal): Promise<MisResult> {
+  const res = await fetch(`${API_BASE}/mis/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+    signal,
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+export async function downloadMis(reportId: string, fmt: "xlsx" | "pdf") {
+  const res = await fetch(`${API_BASE}/mis/${reportId}/export?fmt=${fmt}`);
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(detail);
+  }
+  const disp = res.headers.get("Content-Disposition") ?? "";
+  const m = /filename="([^"]+)"/.exec(disp);
+  saveBlob(await res.blob(), m ? m[1] : `MIS_Report.${fmt}`);
+}

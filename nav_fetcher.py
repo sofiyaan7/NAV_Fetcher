@@ -8,12 +8,15 @@ Run with:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import pickle
 import re
 import time
 import threading
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -2236,6 +2239,60 @@ def _map_amfi_columns(header_line: str) -> dict:
     return out
 
 
+
+# ─── NAV history disk cache ───────────────────────────────────────────────────
+#
+# AMFI's history endpoint answers a 90-day window in roughly twenty seconds, and
+# fetch_amfi_data_chunked walks the windows one at a time, so a nine-month lookup
+# costs well over a minute. The @st.cache_data below only caches inside a running
+# Streamlit session: from the HTTP API there is no runtime, so every request paid
+# the full download again -- a repeat of the same query was not faster at all.
+#
+# A past window never changes, exactly like past AUM, so it is written to disk and
+# kept. A window that touches today is still moving, so it expires quickly.
+
+NAV_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nav_cache")
+NAV_CACHE_TTL_LIVE = 900.0          # seconds, for a window including today
+
+
+def _nav_cache_path(frmdt: str, todt: str, isin_list, include_direct: bool) -> str:
+    key = json.dumps([frmdt, todt, sorted(isin_list) if isin_list else None,
+                      bool(include_direct)], sort_keys=True)
+    return os.path.join(NAV_CACHE_DIR, hashlib.sha1(key.encode()).hexdigest() + ".pkl")
+
+
+def _nav_cache_window_is_closed(todt: str) -> bool:
+    """True once the window's last day is in the past and can no longer change."""
+    try:
+        end = datetime.strptime(todt, "%d-%b-%Y").date()
+    except (ValueError, TypeError):
+        return False
+    return end < date.today()
+
+
+def _nav_cache_read(path: str, closed: bool):
+    try:
+        if not os.path.exists(path):
+            return None
+        if not closed and (time.time() - os.path.getmtime(path)) > NAV_CACHE_TTL_LIVE:
+            return None
+        with open(path, "rb") as fh:
+            return pickle.load(fh)
+    except Exception:
+        return None            # a corrupt entry is a cache miss, never an error
+
+
+def _nav_cache_write(path: str, df) -> None:
+    try:
+        os.makedirs(NAV_CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump(df, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)   # atomic, so a reader never sees half a file
+    except Exception:
+        pass                    # caching is an optimisation, not a requirement
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = None,
                     include_direct: bool = False) -> pd.DataFrame:
@@ -2250,6 +2307,14 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     import time
+
+    # Served from disk when this window has already been fetched. See the note
+    # above _nav_cache_path: a closed window is kept indefinitely.
+    _closed = _nav_cache_window_is_closed(todt)
+    _cache_file = _nav_cache_path(frmdt, todt, isin_list, include_direct)
+    _hit = _nav_cache_read(_cache_file, _closed)
+    if _hit is not None:
+        return _hit
 
     isin_set = {isin.strip().upper() for isin in isin_list if isin.strip()} if isin_list else None
 
@@ -2397,11 +2462,15 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
         delay *= 2
 
     if not rows:
+        # Not cached: an empty answer usually means AMFI was unwilling rather
+        # than that the window is genuinely empty, and caching that would make
+        # a transient refusal permanent.
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
     df["Plan Type"] = df["Scheme Name"].apply(classify_plan_type)
     df["Option Type"] = df["Scheme Name"].apply(classify_option_type)
+    _nav_cache_write(_cache_file, df)
     return df
 
 

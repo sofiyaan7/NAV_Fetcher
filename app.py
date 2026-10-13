@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import os
 import threading
 import re
@@ -121,35 +122,56 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     todt_str = c_end.strftime("%d-%b-%Y")
     url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
     
-    # Only use file cache on non-Cloud environments (Streamlit Cloud has ephemeral FS
-    # and filling it with large text files causes OOM).  Detect Cloud by the absence
-    # of a writable local amfi_cache directory outside /tmp.
-    _is_cloud = os.environ.get("STREAMLIT_SHARING_MODE") or not os.path.exists(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
-    )
+    # Only use the file cache where the filesystem persists. Streamlit Cloud has an
+    # ephemeral disk and filling it with large text files causes OOM.
+    #
+    # This used to detect Cloud by the *absence* of an amfi_cache directory -- but
+    # the directory is gitignored and nothing creates it, so on every fresh clone
+    # the cache disabled itself and each window was downloaded again from AMFI.
+    # That is a ~20s round trip per 90-day window, which is why a nine-month lookup
+    # took over a minute and a repeat of the same query was no faster.
+    #
+    # Hosting is now read from the environment, and whether the disk is usable is
+    # settled by trying to create the directory rather than by assuming.
+    _is_cloud = bool(os.environ.get("STREAMLIT_SHARING_MODE")
+                     or os.environ.get("NAV_FETCHER_NO_DISK_CACHE"))
+    if not _is_cloud:
+        try:
+            os.makedirs(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache"),
+                exist_ok=True,
+            )
+        except OSError:
+            _is_cloud = True      # read-only or full disk: behave as if hosted
     
     if not _is_cloud:
         cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_key = f"amfi_{c_start.strftime('%Y%m%d')}_{c_end.strftime('%Y%m%d')}"
-        cache_path = os.path.join(cache_dir, f"{cache_key}.txt")
+        # Gzipped: one 90-day window of AMFI's all-scheme dump is ~54MB of text,
+        # so a handful of windows would otherwise put hundreds of MB on disk.
+        cache_path = os.path.join(cache_dir, f"{cache_key}.txt.gz")
         
+        def _read_cached() -> str | None:
+            try:
+                with gzip.open(cache_path, "rt", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+            except Exception:
+                return None      # truncated or half-written: treat as a miss
+
         if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100:
             yesterday = dt_date.today() - timedelta(days=1)
             if c_end < yesterday:
-                try:
-                    with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
-                        return f.read()
-                except Exception:
-                    pass
+                # A window that ended before yesterday can no longer change.
+                cached = _read_cached()
+                if cached is not None:
+                    return cached
             else:
                 file_age = time.time() - os.path.getmtime(cache_path)
                 if file_age < 3600:
-                    try:
-                        with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
-                            return f.read()
-                    except Exception:
-                        pass
+                    cached = _read_cached()
+                    if cached is not None:
+                        return cached
     else:
         cache_path = None
     
@@ -193,8 +215,14 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
         if ";" in content_text and len(content_text) > 100 and not content_text.strip().startswith("<"):
             if not _is_cloud and cache_path:
                 try:
-                    with open(cache_path, "w", encoding="utf-8", errors="ignore") as f:
+                    # Written to a temp name and moved into place, so a reader
+                    # never sees a half-written window and caches a truncated
+                    # history as if it were complete.
+                    tmp = cache_path + ".tmp"
+                    with gzip.open(tmp, "wt", encoding="utf-8", errors="ignore",
+                                   compresslevel=6) as f:
                         f.write(content_text)
+                    os.replace(tmp, cache_path)
                 except Exception:
                     pass
         return content_text
@@ -1419,8 +1447,8 @@ def main() -> None:
             "live AMFI feeds, fuzzy matching, Regular vs Direct analysis, and styled Excel reports."
         ),
         chips=[
-            {"label": "Latest NAV Date", "value": latest_update, "tone": "positive"},
-            {"label": "Schemes Indexed", "value": f"{scheme_count:,}", "tone": "gold"},
+            {"label": "Latest NAV Date", "value": latest_update, "tone": ""},
+            {"label": "Schemes Indexed", "value": f"{scheme_count:,}", "tone": ""},
             {"label": "Data Source", "value": "AMFI India", "tone": ""},
             {"label": "Market", "value": "Mutual Funds", "tone": ""},
         ],

@@ -334,3 +334,66 @@ export async function fetchByCategory(
   }
   return res.json();
 }
+
+// ─── Portfolio Bucket Tracker ────────────────────────────────────────────────
+
+export type BucketHolding = {
+  "Scheme Name": string;
+  ISIN: string;
+  "Weight (%)": number;
+};
+
+export type Bucket = { name: string; holdings: BucketHolding[] };
+
+export type TrackResult = {
+  report_id: string;
+  metrics: Record<string, number | string | null>;
+  latest_nav_date: string | null;
+  tracker_columns: string[];
+  tracker: Record<string, string | number | null>[];
+  composition_columns: string[];
+  composition: Record<string, string | number | null>[];
+};
+
+export const fetchBuckets = (signal?: AbortSignal) =>
+  get<{ buckets: Bucket[] }>("/buckets", signal);
+
+async function send<T>(path: string, method: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const b = await res.json();
+      if (b?.detail) detail = String(b.detail);
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<T>;
+}
+
+export const saveBucket = (name: string, holdings: BucketHolding[]) =>
+  send<{ saved: string }>(`/buckets/${encodeURIComponent(name)}`, "PUT", holdings);
+
+export const deleteBucket = (name: string) =>
+  send<{ deleted: string }>(`/buckets/${encodeURIComponent(name)}`, "DELETE");
+
+export const trackBucket = (opts: {
+  holdings: BucketHolding[];
+  start_date: string;
+  initial_amount: number;
+  skip_sundays: boolean;
+}) => send<TrackResult>("/buckets/track", "POST", opts);
+
+export async function downloadBucketExcel(reportId: string) {
+  const res = await fetch(`${API_BASE}/buckets/${reportId}/export`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const disp = res.headers.get("Content-Disposition") ?? "";
+  const m = /filename="([^"]+)"/.exec(disp);
+  saveBlob(await res.blob(), m ? m[1] : "portfolio_tracker.xlsx");
+}

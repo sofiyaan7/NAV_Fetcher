@@ -22,6 +22,8 @@ fix: one fund over the same window is ~190 rows.
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import uuid
 from collections import OrderedDict
@@ -578,3 +580,149 @@ def performance_by_category(req: CategoryRequest) -> dict:
         "rows": clean.to_dict(orient="records"),
         "note": err,
     }
+
+
+# ─── Portfolio Bucket Tracker ─────────────────────────────────────────────────
+#
+# Streamlit held buckets in session_state, which dies with the browser tab. A
+# web front end has no equivalent, so they live on the server as one JSON file.
+# Same shape, so a bucket made here is the bucket the Streamlit page would make.
+
+BUCKET_STORE = ROOT / "bucket_state" / "buckets.json"
+
+DEFAULT_BUCKET = "Default Balanced Portfolio"
+
+
+def _default_buckets() -> dict:
+    from app import DEFAULT_BUCKET_ROWS
+    return {DEFAULT_BUCKET: DEFAULT_BUCKET_ROWS}
+
+
+def _load_buckets() -> dict:
+    try:
+        if BUCKET_STORE.exists():
+            with open(BUCKET_STORE, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and data:
+                return data
+    except (OSError, ValueError):
+        pass                       # unreadable store falls back to the sample
+    return _default_buckets()
+
+
+def _save_buckets(buckets: dict) -> None:
+    try:
+        BUCKET_STORE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BUCKET_STORE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(buckets, fh, indent=1)
+        os.replace(tmp, BUCKET_STORE)   # atomic: never a half-written store
+    except OSError as exc:
+        raise HTTPException(500, f"Could not save buckets: {exc}") from exc
+
+
+class BucketHolding(BaseModel):
+    scheme_name: str = Field("", alias="Scheme Name")
+    isin: str = Field(..., alias="ISIN")
+    weight: float = Field(0.0, alias="Weight (%)")
+
+    model_config = {"populate_by_name": True}
+
+
+def _holdings_frame(rows) -> "pd.DataFrame":
+    return pd.DataFrame([
+        {"Scheme Name": r.get("Scheme Name", ""), "ISIN": str(r.get("ISIN", "")).strip().upper(),
+         "Weight (%)": float(r.get("Weight (%)") or 0)}
+        for r in rows
+    ])
+
+
+@app.get("/buckets")
+def list_buckets() -> dict:
+    buckets = _load_buckets()
+    return {"buckets": [{"name": n, "holdings": h} for n, h in buckets.items()]}
+
+
+@app.put("/buckets/{name}")
+def save_bucket(name: str, holdings: List[dict]) -> dict:
+    """Create a bucket or replace its composition."""
+    if not name.strip():
+        raise HTTPException(400, "A bucket needs a name")
+    buckets = _load_buckets()
+    buckets[name.strip()] = holdings
+    _save_buckets(buckets)
+    return {"saved": name.strip(), "holdings": len(holdings)}
+
+
+@app.delete("/buckets/{name}")
+def delete_bucket(name: str) -> dict:
+    """Delete Active Bucket. The last one cannot go -- the page needs one."""
+    buckets = _load_buckets()
+    if name not in buckets:
+        raise HTTPException(404, f"No bucket named {name!r}")
+    if len(buckets) == 1:
+        raise HTTPException(400, "That is the only bucket; create another before deleting it.")
+    buckets.pop(name)
+    _save_buckets(buckets)
+    return {"deleted": name, "remaining": list(buckets)}
+
+
+class TrackRequest(BaseModel):
+    holdings: List[dict]
+    start_date: date                 # when the investment started
+    initial_amount: float = 100000.0  # Investment Amount (Rs)
+    skip_sundays: bool = True
+
+
+@app.post("/buckets/track")
+def track_bucket(req: TrackRequest) -> dict:
+    """The 'Track Portfolio' button: run the bucket from its start date to today."""
+    from nav_fetcher import run_live_portfolio
+
+    frame = _holdings_frame(req.holdings)
+    if frame.empty:
+        raise HTTPException(400, "Bucket composition is empty")
+    if req.initial_amount <= 0:
+        raise HTTPException(400, "Investment amount must be greater than zero")
+
+    try:
+        res, err = run_live_portfolio(frame, req.start_date, float(req.initial_amount),
+                                      req.skip_sundays)
+    except Exception as exc:
+        raise HTTPException(500, f"Tracking failed: {exc}") from exc
+    if err or res is None:
+        raise HTTPException(400, err or "The tracker returned nothing")
+
+    rid = _remember({"kind": "bucket", "res": res})
+    tracker = res["tracker"].where(pd.notna(res["tracker"]), None)
+    comp = res["composition"].where(pd.notna(res["composition"]), None)
+    return {
+        "report_id": rid,
+        "metrics": {k: (None if (isinstance(v, float) and pd.isna(v)) else v)
+                    for k, v in res["metrics"].items()},
+        "latest_nav_date": res.get("latest_nav_date"),
+        "tracker_columns": [str(c) for c in tracker.columns],
+        "tracker": tracker.to_dict(orient="records"),
+        "composition_columns": [str(c) for c in comp.columns],
+        "composition": comp.to_dict(orient="records"),
+    }
+
+
+@app.get("/buckets/{report_id}/export")
+def export_bucket(report_id: str) -> Response:
+    """The styled portfolio workbook the Streamlit page downloaded."""
+    from nav_fetcher import style_portfolio_excel
+
+    held = _recall(report_id)
+    if held.get("kind") != "bucket":
+        raise HTTPException(404, "That id is not a tracked bucket")
+    try:
+        blob = style_portfolio_excel(held["res"])
+    except Exception as exc:
+        raise HTTPException(500, f"Could not write the workbook: {exc}") from exc
+    stamp = datetime.now().strftime("%Y%m%d")
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="portfolio_tracker_{stamp}.xlsx"'},
+    )

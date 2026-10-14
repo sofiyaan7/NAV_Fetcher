@@ -20,7 +20,7 @@ const NAV = [
     label: "Portfolio",
     items: [
       { href: "/mis", title: "MIS Generator", icon: Sigma, ready: true },
-      { href: "/buckets", title: "Bucket Tracker", icon: PieChart, ready: false },
+      { href: "/buckets", title: "Bucket Tracker", icon: PieChart, ready: true },
     ],
   },
   {

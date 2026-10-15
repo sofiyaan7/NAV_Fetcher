@@ -1196,35 +1196,38 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
         live = df["AUM"].notna()
     live &= df["AUM"].notna() & (df["AUM"] != 0)
 
-    # Axis, JM and quant file AUM a day late: strip the market move with the NAV
-    # of the previous NAV date. Everyone else: the day's own NAV.
-    # quant's offset is expressed on the AUM, not the NAV, so the flow lands on
-    # the same date the reference pipeline puts it on. Pulling the published AUM
-    # back one observation per scheme makes the engine pair AUM(D+1) against
-    # AUM(D) with return r(D) -- "previous AUM is the day's own reported figure,
-    # the observed AUM is the next day's, NAV return normal".
+    # Which rows are real trading days, kept aside before anything narrows
+    # `live` further. The reference AMCs are rebuilt from exactly these rows at
+    # the end of this function: the pipeline they reconcile against reads AMFI
+    # per date, so it has a row for every day AMFI published a NAV and none at
+    # all for a market holiday, and it applies none of the day-level exclusions
+    # below.
     #
-    # Expressing it on the NAV instead produced the same series shifted a day
-    # later, which is what disagreed with the reference on every quant row.
+    # Carry-forward fills a market holiday by repeating the previous row, so a
+    # synthetic row is one where the NAV *and* the AUM both repeat. Either alone
+    # is a real day:
     #
-    # Only a genuinely published figure may move: a carried or fallback value is
-    # not tomorrow's AUM. The last day has no successor and is left empty, so its
-    # flow is reported unmeasurable rather than invented.
+    #   JM Flexi Cap, 17-Apr-2026   NAV 91.93 -> 92.89, AUM republished
+    #   Axis Flexi Cap, 11-Sep-2026 NAV flat at 28.45 (it is quoted to two
+    #                               decimals), AUM 13,746.60 -> 13,750.92
+    #
+    # so testing the NAV alone drops real trading days for coarsely quoted
+    # funds, and `live` alone drops the days AMFI republished an AUM -- both of
+    # which the reference keeps.
+    if "Scheme Code" in df.columns:
+        _g = df.groupby("Scheme Code")
+        _same = df["NAV"].eq(_g["NAV"].shift(1)) & df["AUM"].eq(_g["AUM"].shift(1))
+    else:
+        _same = df["NAV"].eq(df["NAV"].shift(1)) & df["AUM"].eq(df["AUM"].shift(1))
+    published_live = df["NAV"].notna() & df["AUM"].notna() & (df["AUM"] != 0) & ~_same
+
+    # The return charged against a day's AUM pair is that day's own NAV move,
+    # for every AMC. quant's one-day offset is a property of their AUM filing,
+    # not of their NAV, and is applied in the reference block further down.
     df["_flow_nav"] = df["NAV"]
-    # What the report prints stays the figure AMFI published for that date. Only
-    # the pairing the flow is measured from moves, so a quant row never shows a
-    # neighbouring day's AUM beside its own NAV.
+
+    # What the report prints stays the figure AMFI published for that date.
     published_aum = df["AUM"].copy()
-    if "Scheme Name" in df.columns:
-        lagged = df["Scheme Name"].apply(is_lagged_amc)
-        if lagged.any():
-            source = df["AUM"].where(live)
-            for _code, idxs in df[lagged].groupby(df.loc[lagged, "Scheme Code"]).groups.items():
-                order = list(idxs)
-                df.loc[order, "AUM"] = source.loc[order].shift(-1).values
-            # live must follow the AUM it describes, or the engine would treat a
-            # moved-away value as published.
-            live = live & df["AUM"].notna() & (df["AUM"] != 0)
 
     is_index = df["Asset Class"].astype(str).str.contains(r"Index|ETF|Other Scheme", case=False, regex=True) \
         if "Asset Class" in df.columns else pd.Series(False, index=df.index)
@@ -1300,7 +1303,23 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     if "Scheme Name" in df.columns:
         ref_mask = df["Scheme Name"].apply(is_reference_amc)
         for _code, idxs in df[ref_mask].groupby(df.loc[ref_mask, "Scheme Code"]).groups.items():
-            order = list(idxs)
+            whole = list(idxs)
+            # Only days AMFI actually published. Carry-forward fills market
+            # holidays with the previous day's NAV and AUM, and the reference
+            # pipeline -- which reads AMFI per date -- has no row for those days
+            # at all. Pairing against a carried row shifted a real flow onto the
+            # holiday and left the day before it short: quant Small Cap on
+            # 14-Apr-2026 (Ambedkar Jayanti) reported -38.06 where the reference
+            # has nothing, and 13-Apr read 49.36 instead of pairing with 15-Apr.
+            order = [i for i in whole if bool(published_live.at[i])]
+
+            df.loc[whole, "Closing AUM as on previous day"] = None
+            df.loc[whole, "Daily return"] = None
+            df.loc[whole, "Derived AUM as on curent day"] = None
+            df.loc[whole, "Net flows on current day"] = None
+            if len(order) < 2:
+                continue
+
             nav = pd.to_numeric(df.loc[order, "NAV"], errors="coerce")
             aum = pd.to_numeric(published_aum.loc[order], errors="coerce")
             quant = is_lagged_amc(str(df.at[order[0], "Scheme Name"]))

@@ -22,6 +22,7 @@ fix: one fund over the same window is ~190 rows.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -725,4 +726,111 @@ def export_bucket(report_id: str) -> Response:
         content=blob,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="portfolio_tracker_{stamp}.xlsx"'},
+    )
+
+
+# ─── Fund Performance exports ─────────────────────────────────────────────────
+#
+# The Streamlit page offered "Download Styled Excel" on its results and the
+# rebuild had dropped it. Both selections export, through the same
+# generate_historical_excel the page used, so the workbook is the familiar one.
+
+def _perf_workbook(df: "pd.DataFrame", is_aum_only: bool, stem: str) -> Response:
+    from app import generate_historical_excel
+    try:
+        blob = generate_historical_excel(df, [], is_aum_only=is_aum_only)
+    except Exception as exc:
+        raise HTTPException(500, f"Could not write the workbook: {exc}") from exc
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{stem}.xlsx"',
+                 "X-Row-Count": str(len(df))},
+    )
+
+
+def _safe_stem(text: str) -> str:
+    keep = "".join(c if (c.isalnum() or c in " -_") else "_" for c in text).strip()
+    return (keep or "export").replace(" ", "_")[:60]
+
+
+@app.get("/performance/export")
+def performance_export(
+    isin: str = Query(..., min_length=8),
+    start: date = Query(...),
+    end: date = Query(...),
+    want_nav: bool = True,
+    want_aum: bool = True,
+    want_flows: bool = True,
+    fetch_live_aum: bool = True,
+    carry_forward: bool = True,
+    skip_saturdays: bool = True,
+    skip_sundays: bool = True,
+) -> Response:
+    """Styled workbook for one fund."""
+    if start > end:
+        raise HTTPException(400, "start must not be after end")
+    key = str(isin).strip().upper()
+    idx = _index()
+    row = idx[idx["_isin"] == key]
+    name = str(row.iloc[0].get("Scheme Name", key)) if not row.empty else key
+
+    df, is_aum_only, err = run_historical_export(
+        parsed_isins=[key], start_date=start, end_date=end,
+        carry_forward=carry_forward, skip_sundays=skip_sundays,
+        want_nav=want_nav, want_aum=want_aum, want_flows=want_flows,
+        fetch_live_aum=fetch_live_aum, skip_saturdays=skip_saturdays,
+    )
+    if df is None or df.empty:
+        raise HTTPException(404, err or "AMFI returned no rows for that fund and window")
+    return _perf_workbook(df, is_aum_only,
+                          f"{_safe_stem(name)}_{start:%Y%m%d}_{end:%Y%m%d}")
+
+
+@app.post("/performance/category/export")
+def performance_category_export(req: CategoryRequest) -> Response:
+    """Styled workbook for every scheme in a category."""
+    if req.start > req.end:
+        raise HTTPException(400, "start must not be after end")
+    m_id = MATURITY_IDS.get(req.maturity_type)
+    c_id = CATEGORY_IDS.get(req.category)
+    if m_id is None or c_id is None:
+        raise HTTPException(400, "Unknown maturity type or category")
+
+    isins, *_ = _isins_for_category(m_id, c_id, req.subcategory_id)
+    if not isins:
+        raise HTTPException(404, "No schemes in the AMFI index match that selection")
+
+    df, is_aum_only, err = run_historical_export(
+        parsed_isins=list(isins), start_date=req.start, end_date=req.end,
+        carry_forward=req.carry_forward, skip_sundays=req.skip_sundays,
+        want_nav=req.want_nav, want_aum=req.want_aum, want_flows=req.want_flows,
+        fetch_live_aum=req.fetch_live_aum, skip_saturdays=req.skip_saturdays,
+    )
+    if df is None or df.empty:
+        raise HTTPException(404, err or "AMFI returned no rows for that selection")
+    return _perf_workbook(df, is_aum_only,
+                          f"{_safe_stem(req.category)}_{req.start:%Y%m%d}_{req.end:%Y%m%d}")
+
+
+@app.get("/aum-cache/export")
+def aum_cache_export() -> Response:
+    """The cache inventory as a workbook, so coverage gaps can be seen at a glance."""
+    import aum_backfill
+
+    summary = aum_backfill.cache_summary()
+    frame = pd.DataFrame([{
+        "Cached queries": summary.get("files", 0),
+        "Dates covered": summary.get("dates", 0),
+        "Size (MB)": summary.get("mb", 0),
+        "Earliest": summary.get("earliest"),
+        "Latest": summary.get("latest"),
+    }])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        frame.to_excel(writer, sheet_name="AUM cache", index=False)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="aum_cache_summary.xlsx"'},
     )

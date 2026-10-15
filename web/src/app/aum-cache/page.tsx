@@ -5,7 +5,9 @@ import { SiteHeader } from "@/components/site-header";
 import { StatCards } from "@/components/stat-cards";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { AumCacheStats, fetchAumCacheStats } from "@/lib/api";
+import { AumCacheStats, downloadAumCacheExcel, fetchAumCacheStats } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { Download } from "lucide-react";
 
 export default function AumCachePage() {
   const [stats, setStats] = useState<AumCacheStats | null>(null);
@@ -24,13 +26,18 @@ export default function AumCachePage() {
       <SiteHeader breadcrumb={["System", "AUM Cache"]} />
       <main className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-5xl space-y-5 p-5">
-          <div>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
             <h1 className="text-xl font-semibold tracking-tight">AUM Cache</h1>
             <p className="mt-1 text-sm text-muted-foreground">
               AMFI rate-limits by IP and answers 403 once it decides a caller is being greedy, so
               published AUM is collected slowly and kept on disk. Past-date AUM never changes, so
               the cache is write-once.
             </p>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => downloadAumCacheExcel().catch((e) => setError((e as Error).message))}>
+              <Download /> Export to Excel
+            </Button>
           </div>
 
           {error && (

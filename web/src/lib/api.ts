@@ -397,3 +397,54 @@ export async function downloadBucketExcel(reportId: string) {
   const m = /filename="([^"]+)"/.exec(disp);
   saveBlob(await res.blob(), m ? m[1] : "portfolio_tracker.xlsx");
 }
+
+// ─── Fund Performance exports ────────────────────────────────────────────────
+
+async function downloadFrom(url: string, fallback: string) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const b = await res.json();
+      if (b?.detail) detail = String(b.detail);
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(detail);
+  }
+  const disp = res.headers.get("Content-Disposition") ?? "";
+  const m = /filename="([^"]+)"/.exec(disp);
+  saveBlob(await res.blob(), m ? m[1] : fallback);
+}
+
+export const downloadFundExcel = (
+  isin: string, start: string, end: string, liveAum: boolean,
+) => downloadFrom(
+  `${API_BASE}/performance/export?isin=${encodeURIComponent(isin)}&start=${start}&end=${end}` +
+    `&fetch_live_aum=${liveAum}`,
+  "fund_performance.xlsx",
+);
+
+export const downloadAumCacheExcel = () =>
+  downloadFrom(`${API_BASE}/aum-cache/export`, "aum_cache_summary.xlsx");
+
+export async function downloadCategoryExcel(opts: CategoryOptions) {
+  const res = await fetch(`${API_BASE}/performance/category/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const b = await res.json();
+      if (b?.detail) detail = String(b.detail);
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(detail);
+  }
+  const disp = res.headers.get("Content-Disposition") ?? "";
+  const m = /filename="([^"]+)"/.exec(disp);
+  saveBlob(await res.blob(), m ? m[1] : "fund_performance.xlsx");
+}

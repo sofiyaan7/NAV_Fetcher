@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Loader2, Play } from "lucide-react";
+import { Download, Loader2, Play } from "lucide-react";
 import { SiteHeader } from "@/components/site-header";
 import { FundCombobox } from "@/components/fund-combobox";
 import { StatCards, summarise } from "@/components/stat-cards";
@@ -16,6 +16,7 @@ import { SelectField } from "@/components/ui/select-field";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   CATEGORIES, CATEGORY_IDS, COL, CategoryResult, Fund, MATURITY_TYPES, Performance, Subcategory,
+  downloadCategoryExcel, downloadFundExcel,
   fetchByCategory, fetchPerformance, fetchSubcategories, num,
 } from "@/lib/api";
 
@@ -51,6 +52,7 @@ export default function FundPerformancePage() {
   const [bulk, setBulk] = useState<CategoryResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     const now = new Date();
@@ -89,6 +91,27 @@ export default function FundPerformancePage() {
       setError((e as Error).message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const exportExcel = async () => {
+    setExporting(true); setError(null);
+    try {
+      if (mode === "Specific fund" && fund) {
+        await downloadFundExcel(fund.isin, start, end, liveAum);
+      } else {
+        await downloadCategoryExcel({
+          maturity_type: maturity, category,
+          subcategory_id: subcatId === "ALL" ? null : Number(subcatId),
+          start, end,
+          carry_forward: carryForward, skip_saturdays: skipSaturdays, skip_sundays: skipSundays,
+          want_nav: wantNav, want_aum: wantAum, want_flows: wantFlows, fetch_live_aum: liveAum,
+        });
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -182,10 +205,18 @@ export default function FundPerformancePage() {
               </div>
 
               <div className="border-t pt-4">
-                <Button onClick={run} disabled={!canRun} className="w-full sm:w-auto">
-                  {busy ? <Loader2 className="animate-spin" /> : <Play />}
-                  {busy ? "Fetching…" : "Go"}
-                </Button>
+                <div className="flex flex-wrap gap-3">
+                  <Button onClick={run} disabled={!canRun}>
+                    {busy ? <Loader2 className="animate-spin" /> : <Play />}
+                    {busy ? "Fetching…" : "Go"}
+                  </Button>
+                  {(single || bulk) && (
+                    <Button variant="outline" onClick={exportExcel} disabled={exporting || busy}>
+                      {exporting ? <Loader2 className="animate-spin" /> : <Download />}
+                      {exporting ? "Building…" : "Download Styled Excel"}
+                    </Button>
+                  )}
+                </div>
                 {mode === "By category" && subcatId === "ALL" && category === "Equity" && (
                   <p className="mt-2 text-xs text-muted-foreground">
                     Equity → ALL matches about 2,450 scheme rows. Narrowing the subcategory, or

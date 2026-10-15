@@ -659,6 +659,22 @@ def _find_by_nav(scheme_name: str, perf_rows: list,
 # and Aditya Birla Sun Life Quant Fund belong to Axis and ABSL.
 _LAGGED_AMC = re.compile(r"^\s*quant\b", re.I)
 
+# AMCs whose flows are reconciled line by line against scripts/calculate_flows.py.
+# For these the reference arithmetic is reproduced exactly: each day is paired
+# with the row immediately before it, and none of this engine's data-error
+# guards apply -- no zeroing of a repeated AUM, no implausible-flow suppression,
+# no skipping of a day whose AUMs did not move with NAVs.
+#
+# That is the point: these figures have to tie out to that report, and a guard
+# that improves a number is still a number the report does not have. Every other
+# AMC keeps the guards.
+_REFERENCE_AMC = re.compile(r"^\s*(quant|axis|jm)\b", re.I)
+
+
+def is_reference_amc(scheme_name) -> bool:
+    """True for AMCs reconciled directly against the in-house flow pipeline."""
+    return bool(_REFERENCE_AMC.match(str(scheme_name or "")))
+
 
 def is_lagged_amc(scheme_name) -> bool:
     """True for schemes whose AUM is filed one day late (quant AMC only)."""
@@ -1268,6 +1284,39 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
             else:
                 df.at[idx, "Net flows on current day"] = flow
             anchor = (idx, float(aum_i), float(nav_i), date_i)
+
+    # ── Reference AMCs: recomputed exactly as scripts/calculate_flows.py does ──
+    #
+    #     flow(t) = AUM(t) - AUM(t-1) x NAV(t)/NAV(t-1)
+    #
+    # and for quant, whose AUM is filed a day late, the pair shifts forward:
+    #
+    #     flow(t) = AUM(t+1) - AUM(t) x NAV(t)/NAV(t-1)
+    #
+    # Strictly the previous row, not the last *published* figure the walk above
+    # anchors on, and with no guards. Anything the reference cannot compute --
+    # the first row, and quant's last row, which has no successor -- is left
+    # blank rather than booked as zero.
+    if "Scheme Name" in df.columns:
+        ref_mask = df["Scheme Name"].apply(is_reference_amc)
+        for _code, idxs in df[ref_mask].groupby(df.loc[ref_mask, "Scheme Code"]).groups.items():
+            order = list(idxs)
+            nav = pd.to_numeric(df.loc[order, "NAV"], errors="coerce")
+            aum = pd.to_numeric(published_aum.loc[order], errors="coerce")
+            quant = is_lagged_amc(str(df.at[order[0], "Scheme Name"]))
+
+            prev_aum = aum if quant else aum.shift(1)
+            cur_aum = aum.shift(-1) if quant else aum
+            growth = nav / nav.shift(1)
+
+            derived = prev_aum * growth
+            flow = cur_aum - derived
+            usable = prev_aum.notna() & cur_aum.notna() & growth.notna()
+
+            df.loc[order, "Closing AUM as on previous day"] = prev_aum.where(usable)
+            df.loc[order, "Daily return"] = ((growth - 1) * 100).where(usable)
+            df.loc[order, "Derived AUM as on curent day"] = derived.where(usable)
+            df.loc[order, "Net flows on current day"] = flow.where(usable)
 
     if implausible:
         _LAST_FLOW_NOTES.append(

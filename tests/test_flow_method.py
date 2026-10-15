@@ -106,10 +106,15 @@ def test_quant_pairs_todays_aum_against_tomorrows():
     assert f["02-09-2026"] == pytest.approx(1210 - 1100 * 110 / 100)
 
 
-def test_quant_last_day_has_no_successor_so_books_no_flow():
+def test_quant_last_day_has_no_successor_so_is_left_blank():
+    """The reference cannot compute it either, so it stays empty rather than 0.
+
+    A zero reads as "measured, and nothing moved". Nothing was measured.
+    """
     df = _frame("quant Small Cap Fund", 5, [100, 110, 121, 121], [1000, 1100, 1210, 1210])
     f = _flows(df)
-    assert f["04-09-2026"] in (0.0, None)
+    last = f["04-09-2026"]
+    assert last is None or pd.isna(last)
 
 
 @pytest.mark.parametrize("name", ["Axis Large Cap Fund", "Axis Quant Fund",

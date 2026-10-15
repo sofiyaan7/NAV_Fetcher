@@ -1,0 +1,24 @@
+# One-click deploy of the Python API on Render.
+#
+#   1. Push this repo to GitHub (already done)
+#   2. render.com -> New -> Blueprint -> pick this repo
+#   3. Copy the service URL Render gives you
+#   4. Set NEXT_PUBLIC_API_URL to that URL in the Vercel project, and redeploy
+#
+# The free plan sleeps after inactivity, so the first request of the day takes
+# an extra ~30s to wake the service. Everything after that is normal speed.
+services:
+  - type: web
+    name: nav-terminal-api
+    runtime: docker
+    dockerfilePath: ./api/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # AMFI answers a 90-day NAV window in ~20s, so a cold request is slow and
+      # the disk cache is what makes the second one fast. Render's free plan has
+      # an ephemeral disk: the cache still works within a run, just not across
+      # restarts.
+      - key: PYTHONUNBUFFERED
+        value: "1"

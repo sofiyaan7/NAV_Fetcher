@@ -1,0 +1,68 @@
+# Publish the front end to GitHub Pages.
+#
+# Pages serves static files, so it can host the UI but not the Python API --
+# that needs a container host (see render.yaml). Without NEXT_PUBLIC_API_URL
+# the app still loads and explains that the data service is unreachable, which
+# is useful on its own for reviewing the interface.
+name: Deploy front end to Pages
+
+on:
+  push:
+    branches: [main]
+    paths: ["web/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: "Base URL of the Python API (blank = unreachable, UI only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; a newer push supersedes a running one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - name: Build static export
+        env:
+          GITHUB_PAGES: "true"
+          # Set the repository variable API_URL (Settings -> Secrets and
+          # variables -> Actions -> Variables) once the API is hosted, or pass
+          # it when running this workflow by hand.
+          NEXT_PUBLIC_API_URL: ${{ inputs.api_url || vars.API_URL }}
+        run: npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

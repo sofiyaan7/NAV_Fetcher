@@ -13,17 +13,46 @@ import { API_BASE } from "@/lib/api";
  * looks broken -- an empty search and no explanation.
  */
 export function ApiStatus() {
-  const [state, setState] = useState<"checking" | "ok" | "down">("checking");
+  const [state, setState] = useState<"checking" | "waking" | "ok" | "down">("checking");
 
   useEffect(() => {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 8000);
-    fetch(`${API_BASE}/health`, { signal: ctl.signal, cache: "no-store" })
-      .then((r) => setState(r.ok ? "ok" : "down"))
-      .catch(() => setState("down"))
-      .finally(() => clearTimeout(timer));
-    return () => { clearTimeout(timer); ctl.abort(); };
+    // A free host sleeps when idle and takes 30-60s to wake, so a single short
+    // probe reports "down" for a service that is merely starting. Keep probing
+    // for up to 90s and say it is waking in the meantime.
+    const deadline = Date.now() + 90_000;
+    let ctl = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+
+    const probe = () => {
+      ctl = new AbortController();
+      const abort = setTimeout(() => ctl.abort(), 15_000);
+      fetch(`${API_BASE}/health`, { signal: ctl.signal, cache: "no-store" })
+        .then((r) => { if (!r.ok) throw new Error(String(r.status)); if (!cancelled) setState("ok"); })
+        .catch(() => {
+          if (cancelled) return;
+          if (Date.now() < deadline) {
+            setState("waking");
+            timer = setTimeout(probe, 3_000);
+          } else {
+            setState("down");
+          }
+        })
+        .finally(() => clearTimeout(abort));
+    };
+    probe();
+    return () => { cancelled = true; clearTimeout(timer); ctl.abort(); };
   }, []);
+
+  if (state === "waking") {
+    return (
+      <div className="border-b bg-muted/60 px-5 py-3">
+        <div className="mx-auto max-w-7xl text-sm text-muted-foreground">
+          Waking the data service — the free host sleeps when idle and takes up to a minute to start.
+        </div>
+      </div>
+    );
+  }
 
   if (state !== "down") return null;
 

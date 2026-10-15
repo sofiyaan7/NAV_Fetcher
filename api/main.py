@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from amfi_nav import LATEST_CACHE_FILE                      # noqa: E402
+from amfi_nav import LATEST_CACHE_FILE, fetch_nav_data      # noqa: E402
 from app import run_historical_export, select_regular_growth_isins  # noqa: E402
 from nav_fetcher import map_section_to_ids                  # noqa: E402
 
@@ -76,7 +76,11 @@ def _index() -> pd.DataFrame:
     Cached: it is a file on disk that the fetcher refreshes, not per-request work.
     """
     if not LATEST_CACHE_FILE.exists():
-        raise HTTPException(503, "Scheme index cache is missing; run the fetcher once.")
+        # A fresh container (Render) ships without cache/, so build it from AMFI.
+        try:
+            fetch_nav_data()
+        except Exception as exc:
+            raise HTTPException(503, f"Scheme index cache is missing and AMFI could not be reached: {exc}") from exc
     df = pd.read_csv(LATEST_CACHE_FILE)
     df["_isin"] = df[ISIN_COL].astype(str).str.strip().str.upper()
     df["_name_lower"] = df["Scheme Name"].astype(str).str.lower()

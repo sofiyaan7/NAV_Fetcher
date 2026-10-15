@@ -87,20 +87,32 @@ export function FundCombobox({
         <ul id={listId} role="listbox"
             className="absolute z-50 mt-1.5 max-h-80 w-full overflow-auto rounded-md border bg-popover p-1 shadow-md">
           {results.map((f, i) => (
-            <li key={f.isin} role="option" aria-selected={i === active}>
-              <button type="button" onMouseEnter={() => setActive(i)} onClick={() => choose(f)}
-                className={cn("flex w-full items-center justify-between gap-3 rounded-sm px-2 py-1.5 text-left",
-                              i === active && "bg-accent")}>
-                <span className="min-w-0">
-                  <span className="block truncate text-sm">{f.scheme_name}</span>
-                  <span className="block truncate text-xs text-muted-foreground">{f.amc} · {f.isin}</span>
+            // The row itself is the option. It used to wrap a <button> that
+            // carried the click, but the row is what sits under the pointer, so
+            // a real mouse click landed on the <li> and nothing happened --
+            // selecting a fund was impossible with a mouse. onMouseDown is
+            // prevented so focus stays in the input, as a combobox should.
+            <li
+              key={f.isin}
+              role="option"
+              aria-selected={i === active}
+              onMouseEnter={() => setActive(i)}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => choose(f)}
+              className={cn(
+                "flex cursor-pointer items-center justify-between gap-3 rounded-sm px-2 py-1.5",
+                i === active && "bg-accent",
+              )}
+            >
+              <span className="min-w-0">
+                <span className="block truncate text-sm">{f.scheme_name}</span>
+                <span className="block truncate text-xs text-muted-foreground">{f.amc} · {f.isin}</span>
+              </span>
+              {f.latest_nav !== null && (
+                <span className="tabular shrink-0 font-mono text-xs text-muted-foreground">
+                  {f.latest_nav.toFixed(2)}
                 </span>
-                {f.latest_nav !== null && (
-                  <span className="tabular shrink-0 font-mono text-xs text-muted-foreground">
-                    {f.latest_nav.toFixed(2)}
-                  </span>
-                )}
-              </button>
+              )}
             </li>
           ))}
         </ul>

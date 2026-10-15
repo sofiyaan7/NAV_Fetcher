@@ -668,6 +668,10 @@ _LAGGED_AMC = re.compile(r"^\s*quant\b", re.I)
 # That is the point: these figures have to tie out to that report, and a guard
 # that improves a number is still a number the report does not have. Every other
 # AMC keeps the guards.
+# scripts/calculate_flows.py drops this date in prepare_input, so the reference
+# figures have no row for it and the day after pairs across it.
+REFERENCE_EXCLUDED_DATE = "2026-03-31"
+
 _REFERENCE_AMC = re.compile(r"^\s*(quant|axis|jm)\b", re.I)
 
 
@@ -1229,6 +1233,22 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     # What the report prints stays the figure AMFI published for that date.
     published_aum = df["AUM"].copy()
 
+    # The rows the reference database would hold, used only by the reference
+    # AMCs below. A carry-forward fill repeats the whole row, so NAV and AUM
+    # both matching the day before marks it. 31-Mar-2026 is dropped because
+    # prepare_input in that pipeline drops it outright -- AMFI's year-end
+    # figures for that date are not trusted there, and keeping it put
+    # quant Small Cap's 01-Apr at 11.61 against its 12.52.
+    if "Scheme Code" in df.columns:
+        _g = df.groupby("Scheme Code")
+        _carried = df["NAV"].eq(_g["NAV"].shift(1)) & df["AUM"].eq(_g["AUM"].shift(1))
+    else:
+        _carried = df["NAV"].eq(df["NAV"].shift(1)) & df["AUM"].eq(df["AUM"].shift(1))
+    reference_rows = (
+        df["NAV"].notna() & df["AUM"].notna() & (df["AUM"] != 0) & ~_carried
+        & (df["NAV Date_parsed"] != pd.Timestamp(REFERENCE_EXCLUDED_DATE))
+    )
+
     is_index = df["Asset Class"].astype(str).str.contains(r"Index|ETF|Other Scheme", case=False, regex=True) \
         if "Asset Class" in df.columns else pd.Series(False, index=df.index)
 
@@ -1314,7 +1334,27 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     if "Scheme Name" in df.columns:
         ref_mask = df["Scheme Name"].apply(is_reference_amc)
         for _code, idxs in df[ref_mask].groupby(df.loc[ref_mask, "Scheme Code"]).groups.items():
-            order = list(idxs)
+            whole = list(idxs)
+            # The reference database holds one row per day AMFI published, so it
+            # has no row for a market holiday -- confirmed against its output for
+            # quant Small Cap, which skips 03-Apr and 14-Apr-2026 entirely and
+            # puts 13-Apr at 11.30. Carry-forward fills those days here by
+            # repeating the previous row, so a row whose NAV *and* AUM both
+            # repeat is that fill and is excluded.
+            #
+            # Either alone is a real day and is kept: JM Flexi Cap on
+            # 17-Apr-2026 moved 91.93 -> 92.89 with the AUM republished, and
+            # Axis Flexi Cap on 11-Sep-2026 sat flat at 28.45 -- it is quoted to
+            # two decimals -- while its AUM moved.
+            order = [i for i in whole if bool(reference_rows.at[i])]
+
+            df.loc[whole, "Closing AUM as on previous day"] = None
+            df.loc[whole, "Daily return"] = None
+            df.loc[whole, "Derived AUM as on curent day"] = None
+            df.loc[whole, "Net flows on current day"] = None
+            if len(order) < 2:
+                continue
+
             nav = pd.to_numeric(df.loc[order, "NAV"], errors="coerce").round(4)
             aum = pd.to_numeric(published_aum.loc[order], errors="coerce").round(3)
             quant = is_lagged_amc(str(df.at[order[0], "Scheme Name"]))

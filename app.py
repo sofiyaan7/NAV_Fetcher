@@ -547,9 +547,16 @@ def run_historical_export(
     if want_flows:
         fetch_start_date = start_date - timedelta(days=10)
 
-    # AUM keeps its own date for every AMC (the one-day-late filers are handled
-    # in the flow formula with the earlier NAV), so nothing past end_date is needed.
-    fetch_end_date = end_date
+    # quant files a day's AUM against the following day, and the flow formula
+    # pairs a day against the *next* published AUM, so the last requested day has
+    # no successor unless one more trading day is fetched. Without it quant's
+    # final row came back blank where the reference report has a figure --
+    # 21-Apr-2026 was missing from a 01-21 Apr run.
+    #
+    # Five calendar days clears a weekend plus a holiday. The extra rows are
+    # trimmed back to the requested window before the frame is returned, and the
+    # cost is one more day inside an already-fetched 90-day chunk.
+    fetch_end_date = end_date + timedelta(days=5)
         
     try:
         # Determine if running inside Streamlit context
@@ -904,14 +911,6 @@ def run_historical_export(
             # non-trading ones have neither a NAV nor an AUM — they render as a
             # run of "None" cells that reads like a broken report rather than a
             # closed market. Nothing is lost: these rows never held a value.
-            # Trim the extra days fetched for quant's one-day offset.
-            try:
-                _dcol = "NAV Date" if "NAV Date" in df_res_final.columns else "AUM Date"
-                _d = parse_amfi_date_series(df_res_final[_dcol])
-                df_res_final = df_res_final[_d.dt.date <= _requested_end].reset_index(drop=True)
-            except Exception:
-                pass
-
             _obs = [c for c in ("NAV", "AUM") if c in df_res_final.columns]
             if _obs:
                 _empty = df_res_final[_obs].isna().all(axis=1)
@@ -924,6 +923,18 @@ def run_historical_export(
             if want_flows:
                 df_res_final = calculate_flows_for_dataframe(df_res_final, start_date, ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"])
                 is_aum_only = False
+
+            # Trim the days fetched past the requested end only now. quant's flow
+            # for a day needs the *next* published AUM, so trimming before the
+            # calculation left the last requested day blank -- 21-Apr-2026 came
+            # back empty from a 01-21 Apr run where the reference has -8.23.
+            try:
+                _dcol = "NAV Date" if "NAV Date" in df_res_final.columns else "AUM Date"
+                _d = parse_amfi_date_series(df_res_final[_dcol])
+                df_res_final = df_res_final[_d.dt.date <= _requested_end].reset_index(drop=True)
+            except Exception:
+                pass
+
             df_res_final = df_res_final.drop(columns=["_aum_live"], errors="ignore")
         else:
             df_res_final = pd.DataFrame(columns=ordered_cols)

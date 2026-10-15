@@ -642,10 +642,26 @@ def _find_by_nav(scheme_name: str, perf_rows: list,
 # Anchored at the start of the scheme name, where the AMC name sits; the NAV
 # frames carry no AMC column. Quantum is a different house, and Axis Quant Fund
 # is Axis -- "quant" must be the first word. JM's schemes start "JM ".
-_LAGGED_AMC = re.compile(r"^\s*(quant|axis|jm)\b", re.I)
+# quant files a day's AUM against the following day. The in-house flow pipeline
+# (scripts/calculate_flows.py) states it as: the previous AUM is the day's own
+# reported figure and the observed AUM is the next day's, with the NAV return
+# left normal. That is the definition followed here.
+#
+# Axis and JM used to be in this set. The reference pipeline applies no offset
+# to either -- it names Axis only to offer an "Excluding Axis" total, and does
+# not mention JM at all -- and lagging them moved their flows by a day against
+# it. Measured over Large Cap and Flexi Cap for 01-20 Sep 2026, that disagreed
+# on 24 of 26 Axis rows (up to 566cr) and 23 of 26 JM rows (up to 123cr).
+#
+# Anchored at the start of the name: the AMC name leads it and the NAV frames
+# carry no AMC column. Anchoring separates the AMC from everything else
+# containing the string -- Quantum is a different house, and Axis Quant Fund
+# and Aditya Birla Sun Life Quant Fund belong to Axis and ABSL.
+_LAGGED_AMC = re.compile(r"^\s*quant\b", re.I)
 
 
 def is_lagged_amc(scheme_name) -> bool:
+    """True for schemes whose AUM is filed one day late (quant AMC only)."""
     return bool(_LAGGED_AMC.match(str(scheme_name or "")))
 
 
@@ -1166,9 +1182,33 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
 
     # Axis, JM and quant file AUM a day late: strip the market move with the NAV
     # of the previous NAV date. Everyone else: the day's own NAV.
-    lagged = df["Scheme Name"].apply(is_lagged_amc) if "Scheme Name" in df.columns else pd.Series(False, index=df.index)
-    prev_nav = df.groupby("Scheme Code")["NAV"].shift(1)
-    df["_flow_nav"] = df["NAV"].where(~lagged, prev_nav)
+    # quant's offset is expressed on the AUM, not the NAV, so the flow lands on
+    # the same date the reference pipeline puts it on. Pulling the published AUM
+    # back one observation per scheme makes the engine pair AUM(D+1) against
+    # AUM(D) with return r(D) -- "previous AUM is the day's own reported figure,
+    # the observed AUM is the next day's, NAV return normal".
+    #
+    # Expressing it on the NAV instead produced the same series shifted a day
+    # later, which is what disagreed with the reference on every quant row.
+    #
+    # Only a genuinely published figure may move: a carried or fallback value is
+    # not tomorrow's AUM. The last day has no successor and is left empty, so its
+    # flow is reported unmeasurable rather than invented.
+    df["_flow_nav"] = df["NAV"]
+    # What the report prints stays the figure AMFI published for that date. Only
+    # the pairing the flow is measured from moves, so a quant row never shows a
+    # neighbouring day's AUM beside its own NAV.
+    published_aum = df["AUM"].copy()
+    if "Scheme Name" in df.columns:
+        lagged = df["Scheme Name"].apply(is_lagged_amc)
+        if lagged.any():
+            source = df["AUM"].where(live)
+            for _code, idxs in df[lagged].groupby(df.loc[lagged, "Scheme Code"]).groups.items():
+                order = list(idxs)
+                df.loc[order, "AUM"] = source.loc[order].shift(-1).values
+            # live must follow the AUM it describes, or the engine would treat a
+            # moved-away value as published.
+            live = live & df["AUM"].notna() & (df["AUM"] != 0)
 
     is_index = df["Asset Class"].astype(str).str.contains(r"Index|ETF|Other Scheme", case=False, regex=True) \
         if "Asset Class" in df.columns else pd.Series(False, index=df.index)
@@ -1185,7 +1225,7 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
             + "; those days' AUMs were not used and their flows fall on the next day.")
 
     df["Closing AUM as on previous day"] = None
-    df["Actual AUM as on current date"] = df["AUM"]
+    df["Actual AUM as on current date"] = published_aum
     df["Daily return"] = None
     df["Derived AUM as on curent day"] = None
     df["Net flows on current day"] = None

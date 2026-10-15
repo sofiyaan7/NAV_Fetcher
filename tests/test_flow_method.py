@@ -90,22 +90,39 @@ def test_scheme_missing_from_amfi_list_is_bridged():
     assert f["04-09-2026"] == pytest.approx(530 - 510 * 10.5 / 10.2)
 
 
-# ─── one-day-late AMCs ─────────────────────────────────────────────────────────
+# ─── quant's one-day AUM offset ────────────────────────────────────────────────
+#
+# quant files a day's AUM against the following day. The in-house pipeline
+# (scripts/calculate_flows.py) defines it as: previous AUM is the day's own
+# reported figure, observed AUM is the next day's, NAV return normal. These
+# pin that definition, because expressing it on the NAV instead produces the
+# same series a day later and disagrees with every quant row in that report.
 
-@pytest.mark.parametrize("name", ["quant Small Cap Fund", "Axis Large Cap Fund",
-                                  "Axis Quant Fund", "JM Flexicap Fund"])
-def test_lagged_amcs_use_the_previous_nav_date(name):
-    assert is_lagged_amc(name)
-    df = _frame(name, 5, [100, 110, 121, 121], [1000, 1000, 1100, 1210])
+def test_quant_pairs_todays_aum_against_tomorrows():
+    assert is_lagged_amc("quant Small Cap Fund")
+    df = _frame("quant Small Cap Fund", 5, [100, 110, 121, 121], [1000, 1100, 1210, 1210])
     f = _flows(df)
-    # AUM of 03-Sep reflects the 02-Sep NAV move (100 -> 110): 1100 = 1000 x 1.1
-    assert f["03-09-2026"] == pytest.approx(1100 - 1000 * 110 / 100)
-    assert f["04-09-2026"] == pytest.approx(1210 - 1100 * 121 / 110)
+    # 02-Sep: AUM(03-Sep) against AUM(02-Sep) grown by the 02-Sep return.
+    assert f["02-09-2026"] == pytest.approx(1210 - 1100 * 110 / 100)
 
 
-@pytest.mark.parametrize("name", ["Quantum Value Fund", "Aditya Birla Sun Life Quant Fund",
+def test_quant_last_day_has_no_successor_so_books_no_flow():
+    df = _frame("quant Small Cap Fund", 5, [100, 110, 121, 121], [1000, 1100, 1210, 1210])
+    f = _flows(df)
+    assert f["04-09-2026"] in (0.0, None)
+
+
+@pytest.mark.parametrize("name", ["Axis Large Cap Fund", "Axis Quant Fund",
+                                  "JM Flexicap Fund", "Quantum Value Fund",
+                                  "Aditya Birla Sun Life Quant Fund",
                                   "HDFC Mid Cap Fund", "JMX Fund"])
-def test_other_amcs_use_the_same_day_nav(name):
+def test_every_other_amc_is_unshifted(name):
+    """Axis and JM included: the reference pipeline offsets neither.
+
+    It names Axis only to offer an "Excluding Axis" total and does not mention
+    JM at all. Lagging them moved their flows a day against that report -- 24 of
+    26 Axis rows and 23 of 26 JM rows over 01-20 Sep 2026.
+    """
     assert not is_lagged_amc(name)
     df = _frame(name, 6, [100, 110, 121, 121], [1000, 1100, 1210, 1210])
     f = _flows(df)

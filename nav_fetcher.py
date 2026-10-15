@@ -1288,54 +1288,52 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
                 df.at[idx, "Net flows on current day"] = flow
             anchor = (idx, float(aum_i), float(nav_i), date_i)
 
-    # ── Reference AMCs: recomputed exactly as scripts/calculate_flows.py does ──
+    # ── Reference AMCs: scripts/calculate_flows.py, ported line for line ──────
     #
-    #     flow(t) = AUM(t) - AUM(t-1) x NAV(t)/NAV(t-1)
+    #     Previous AUM = AUM.shift(1)              (quant: AUM itself)
+    #     Daily AUM    = AUM                       (quant: AUM.shift(-1))
+    #     NAV Return   = NAV / NAV.shift(1) - 1
+    #     Expected AUM = Previous AUM x (1 + NAV Return)
+    #     Flow         = Daily AUM - Expected AUM
     #
-    # and for quant, whose AUM is filed a day late, the pair shifts forward:
+    # Deliberately literal. Every row the frame carries is used, including the
+    # ones carry-forward fills on a market holiday: the reference shifts by row
+    # position, so removing them moves a real flow onto its neighbour. An
+    # earlier attempt dropped them on the reasoning that the reference's own
+    # pipeline never sees a holiday, and that put quant Small Cap's 13-Apr-2026
+    # at 11.30 where running the reference over these rows gives 49.36.
     #
-    #     flow(t) = AUM(t+1) - AUM(t) x NAV(t)/NAV(t-1)
+    # The '^' stale handling in the reference is a no-op here: that marker lives
+    # in AMFI's raw text, which this frame does not carry, and for quant the
+    # override reassigns Previous AUM immediately afterwards regardless.
     #
-    # Strictly the previous row, not the last *published* figure the walk above
-    # anchors on, and with no guards. Anything the reference cannot compute --
-    # the first row, and quant's last row, which has no successor -- is left
-    # blank rather than booked as zero.
+    # None of this engine's guards apply -- no zeroing of a repeated AUM, no
+    # implausible-flow suppression, no day-level exclusions. These figures have
+    # to tie out to that report, and a guard that improves a number still
+    # produces a number the report does not have.
     if "Scheme Name" in df.columns:
         ref_mask = df["Scheme Name"].apply(is_reference_amc)
         for _code, idxs in df[ref_mask].groupby(df.loc[ref_mask, "Scheme Code"]).groups.items():
-            whole = list(idxs)
-            # Only days AMFI actually published. Carry-forward fills market
-            # holidays with the previous day's NAV and AUM, and the reference
-            # pipeline -- which reads AMFI per date -- has no row for those days
-            # at all. Pairing against a carried row shifted a real flow onto the
-            # holiday and left the day before it short: quant Small Cap on
-            # 14-Apr-2026 (Ambedkar Jayanti) reported -38.06 where the reference
-            # has nothing, and 13-Apr read 49.36 instead of pairing with 15-Apr.
-            order = [i for i in whole if bool(published_live.at[i])]
-
-            df.loc[whole, "Closing AUM as on previous day"] = None
-            df.loc[whole, "Daily return"] = None
-            df.loc[whole, "Derived AUM as on curent day"] = None
-            df.loc[whole, "Net flows on current day"] = None
-            if len(order) < 2:
-                continue
-
-            nav = pd.to_numeric(df.loc[order, "NAV"], errors="coerce")
-            aum = pd.to_numeric(published_aum.loc[order], errors="coerce")
+            order = list(idxs)
+            nav = pd.to_numeric(df.loc[order, "NAV"], errors="coerce").round(4)
+            aum = pd.to_numeric(published_aum.loc[order], errors="coerce").round(3)
             quant = is_lagged_amc(str(df.at[order[0], "Scheme Name"]))
 
             prev_aum = aum if quant else aum.shift(1)
             cur_aum = aum.shift(-1) if quant else aum
-            growth = nav / nav.shift(1)
+            nav_return = nav / nav.shift(1) - 1
+            nav_return = nav_return.where(prev_aum.notna())
 
-            derived = prev_aum * growth
-            flow = cur_aum - derived
-            usable = prev_aum.notna() & cur_aum.notna() & growth.notna()
+            # Both are computed at full precision and rounded only afterwards,
+            # as the reference does. Rounding Expected AUM before subtracting it
+            # moved three of April's twenty quant rows by 0.01.
+            expected = prev_aum * (1 + nav_return)
+            flow = (cur_aum - expected).where(prev_aum.notna())
 
-            df.loc[order, "Closing AUM as on previous day"] = prev_aum.where(usable)
-            df.loc[order, "Daily return"] = ((growth - 1) * 100).where(usable)
-            df.loc[order, "Derived AUM as on curent day"] = derived.where(usable)
-            df.loc[order, "Net flows on current day"] = flow.where(usable)
+            df.loc[order, "Closing AUM as on previous day"] = prev_aum
+            df.loc[order, "Daily return"] = (nav_return * 100).round(6)
+            df.loc[order, "Derived AUM as on curent day"] = expected.round(2)
+            df.loc[order, "Net flows on current day"] = flow.round(2)
 
     if implausible:
         _LAST_FLOW_NOTES.append(

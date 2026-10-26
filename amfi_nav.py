@@ -7,6 +7,7 @@ or a future API wrapper.
 
 from __future__ import annotations
 
+import io
 import json
 import re
 from dataclasses import dataclass
@@ -21,10 +22,15 @@ import requests
 
 
 AMFI_NAV_URL = "https://portal.amfiindia.com/spages/NAVAll.txt"
+# AMFI's scheme master: one row per scheme code with its full NAV name, e.g.
+# "Motilal Oswal Midcap Fund-Regular Plan-Growth Option". Used only to fill in
+# the plan and option where NAVAll leaves them blank (see _parse_nav_text).
+AMFI_SCHEME_MASTER_URL = "https://portal.amfiindia.com/DownloadSchemeData_Po.aspx?mf=0"
 DEFAULT_CACHE_DIR = Path("cache")
 DEFAULT_ARCHIVE_DIR = DEFAULT_CACHE_DIR / "archive"
 LATEST_CACHE_FILE = DEFAULT_CACHE_DIR / "latest_nav.csv"
 META_CACHE_FILE = DEFAULT_CACHE_DIR / "latest_nav_meta.json"
+SCHEME_MASTER_CACHE_FILE = DEFAULT_CACHE_DIR / "scheme_master.csv"
 
 
 class AMFINavError(RuntimeError):
@@ -40,7 +46,9 @@ class CacheMetadata:
 
 PLAN_DIRECT_PATTERNS = [r"\bdirect\b", r"\bdirect plan\b", r"\bdir\b"]
 PLAN_REGULAR_PATTERNS = [r"\bregular\b", r"\bregular plan\b"]
-OPTION_GROWTH_PATTERNS = [r"\bgrowth\b"]
+# ICICI Prudential names its growth option "Cumulative" (Manufacturing,
+# Healthcare, India Opportunities, Nifty 50 Index...): same thing, no payouts.
+OPTION_GROWTH_PATTERNS = [r"\bgrowth\b", r"\bcumulative\b"]
 OPTION_IDCW_PATTERNS = [r"\bidcw\b", r"\bdividend\b", r"income distribution", r"capital withdrawal"]
 OPTION_BONUS_PATTERNS = [r"\bbonus\b"]
 
@@ -65,6 +73,10 @@ def classify_plan_type(scheme_name: str) -> str:
     if any(re.search(pattern, text) for pattern in PLAN_REGULAR_PATTERNS):
         return "Regular"
     return "Unknown"
+
+
+def _option_or_unknown(option: str) -> str:
+    return "Unknown" if option == "Other" else option
 
 
 def classify_option_type(scheme_name: str) -> str:
@@ -128,7 +140,50 @@ def _map_nav_columns(header_line: str) -> dict:
     return out
 
 
-def _parse_nav_text(text: str) -> pd.DataFrame:
+def _scheme_master_names(session: Optional[requests.Session] = None, timeout: int = 60) -> dict:
+    """Scheme code -> AMFI's full NAV name, from the scheme master.
+
+    NAVAll leaves Plan and Option blank for a good number of schemes and gives
+    every plan the same bare name: Motilal Oswal Midcap Fund has four rows all
+    called "Motilal Oswal Midcap Fund", as do HSBC Small Cap and Navi ELSS. With
+    nothing to tell Regular Growth from Direct or IDCW, the selection rule
+    dropped all four and the fund vanished from Fund performance. The scheme
+    master names each code in full, so it settles them.
+
+    Best effort: a failed download falls back to the last saved copy, and with
+    neither the parse carries on exactly as before.
+    """
+    text = None
+    try:
+        client = session or requests.Session()
+        response = client.get(AMFI_SCHEME_MASTER_URL, timeout=timeout,
+                              headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "utf-8"
+        if response.text.lstrip().startswith("AMC,"):
+            text = response.text
+            try:
+                ensure_cache_dirs()
+                SCHEME_MASTER_CACHE_FILE.write_text(text, encoding="utf-8")
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"Warning: AMFI scheme master unavailable ({exc}); using the saved copy if any.")
+    if text is None and SCHEME_MASTER_CACHE_FILE.exists():
+        text = SCHEME_MASTER_CACHE_FILE.read_text(encoding="utf-8")
+    if not text:
+        return {}
+    try:
+        master = pd.read_csv(io.StringIO(text), dtype=str)
+        master.columns = [c.strip() for c in master.columns]
+        master = master.dropna(subset=["Code", "Scheme NAV Name"])
+        return dict(zip(master["Code"].str.strip(), master["Scheme NAV Name"].str.strip()))
+    except Exception as exc:
+        print(f"Warning: could not read the AMFI scheme master: {exc}")
+        return {}
+
+
+def _parse_nav_text(text: str, master_names: Optional[dict] = None) -> pd.DataFrame:
     rows: List[dict] = []
     current_amc = "Unknown AMC"
     current_section = "Unknown"
@@ -174,6 +229,7 @@ def _parse_nav_text(text: str) -> pd.DataFrame:
         nav_date = _col("date")
         _plan = _col("plan")
         _option = _col("option")
+        full_name = (master_names or {}).get(scheme_code) or scheme_name
         nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
         parsed_date = pd.to_datetime(nav_date, format="%d-%b-%Y", errors="coerce")
 
@@ -185,6 +241,10 @@ def _parse_nav_text(text: str) -> pd.DataFrame:
                 "ISIN Div Payout/ ISIN Growth": isin_growth if isin_growth != "-" else None,
                 "ISIN Div Reinvestment": isin_reinvestment if isin_reinvestment != "-" else None,
                 "Scheme Name": scheme_name,
+                # The scheme master's full name ("... -Plan B - Growth option"),
+                # kept so the selection rule can see the share class even where
+                # NAVAll gives only the bare scheme name. Blank when unknown.
+                "Scheme NAV Name": full_name if full_name != scheme_name else "",
                 "Family Name": derive_family_name(scheme_name),
                 "Family Key": build_family_key(scheme_name, current_amc),
                 # AMFI now publishes Plan and Option as their own columns, and
@@ -194,8 +254,16 @@ def _parse_nav_text(text: str) -> pd.DataFrame:
                 # then returned Unknown for every scheme and selection
                 # collapsed -- Large Cap fell from 34 funds to 4. Prefer the
                 # columns and keep the name-based reading as the fallback.
-                "Plan Type": (_plan.title() if _plan else classify_plan_type(scheme_name)),
-                "Option Type": (_option.title() if _option else classify_option_type(scheme_name)),
+                #
+                # Where NAVAll leaves a column blank, the scheme master's full
+                # name for the code is read instead of the bare scheme name.
+                # And an option that nothing names is "Unknown", not "Other":
+                # the selection rule rejects "Other" as a stated non-Growth
+                # option, which dropped every single-class ETF and every Regular
+                # plan AMFI publishes without an option (Tata Nifty 50 Index Fund).
+                "Plan Type": (_plan.title() if _plan else classify_plan_type(full_name)),
+                "Option Type": (_option.title() if _option else
+                                _option_or_unknown(classify_option_type(full_name))),
                 "NAV": nav,
                 "NAV Date": parsed_date,
                 "Source Section": current_section,
@@ -300,7 +368,7 @@ def fetch_nav_data(force_refresh: bool = False, session: Optional[requests.Sessi
 
     try:
         text = _download_nav_text(session=session)
-        frame = _parse_nav_text(text)
+        frame = _parse_nav_text(text, _scheme_master_names(session=session))
         fetched_at = datetime.now(timezone.utc)
         metadata = CacheMetadata(
             fetched_at=fetched_at.isoformat(),

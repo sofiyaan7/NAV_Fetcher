@@ -8,3 +8,6 @@ amfi_cache/
 cache/archive/
 nav_cache/
 bucket_state/
+
+# AMFI scheme master, refetched with every NAV refresh.
+cache/scheme_master.csv

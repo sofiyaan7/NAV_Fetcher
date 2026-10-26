@@ -428,10 +428,51 @@ def select_regular_growth_isins(df_matched):
     Returns (isins, kept, skipped_direct, skipped_option).
     """
     isins, skipped_direct, skipped_option = [], 0, 0
+    # Share classes AMFI still lists but stopped pricing years ago
+    # ("ICICI Prudential Bluechip Fund - Institutional Option - I", last NAV
+    # Apr-2020). A live plan is priced every business day, so anything a month
+    # behind the newest NAV in the set is a closed class, not a fund to report.
+    latest_nav_date = None
+    if "NAV Date" in df_matched.columns:
+        nav_dates = pd.to_datetime(df_matched["NAV Date"], errors="coerce", dayfirst=True)
+        if nav_dates.notna().any():
+            latest_nav_date = nav_dates.max()
+    # An ETF has one unit class, and AMFI labels it at random: SBI Nifty 50 ETF
+    # is "Regular Plan / IDCW", Nippon India ETF Nifty 50 BeES is "Direct Plan"
+    # with no option. The plan and option tests below rejected both, so whole
+    # ETF ranges never appeared. When AMFI lists an ETF as a single row, that
+    # row is the fund, whatever it is labelled.
+    fam_col = "Family Key" if "Family Key" in df_matched.columns else "Scheme Name"
+    rows_per_family = df_matched[fam_col].astype(str).value_counts()
     for _, row in df_matched.iterrows():
         scheme_name = str(row.get("Scheme Name", "")).strip()
-        nm = scheme_name.lower()
+        is_etf = bool(re.search(r"\betf\b|\bbees\b|exchange traded", scheme_name.lower())
+                      or "etf" in str(row.get("Asset Class", "")).lower())
+        if is_etf and rows_per_family.get(str(row.get(fam_col)), 0) == 1:
+            isin_g = row.get("ISIN Div Payout/ ISIN Growth") or row.get("ISIN Div Payout / ISIN Growth")
+            if isin_g and pd.notna(isin_g) and str(isin_g).strip() not in ("", "-"):
+                isins.append(str(isin_g).strip().upper())
+            continue
         plan_type = str(row.get("Plan Type", "")).strip().lower()
+        # NAVAll often gives only the bare scheme name; AMFI's full name for
+        # the code ("Edelweiss Large Cap Fund -Plan B - Growth option") is what
+        # shows the share class, so the name tests below read it too -- but
+        # only where NAVAll states no plan. The dead classes (Plan B/C,
+        # Institutional, Wealth Plan, Unclaimed) all sit there; a row NAVAll
+        # calls "Regular Plan" is the live one even when its full name says
+        # "Retail Plan - Regular Plan" (ABSL Global Excellence) or "Regular
+        # Plan B" (Bandhan Dynamic Term), and reading those names dropped the
+        # fund outright.
+        nav_name = row.get("Scheme NAV Name")
+        nav_name = str(nav_name).strip() if isinstance(nav_name, str) else ""
+        if plan_type not in ("", "unknown", "nan"):
+            nav_name = ""
+        nm = f"{scheme_name} {nav_name}".lower().strip()
+        if latest_nav_date is not None:
+            row_date = pd.to_datetime(row.get("NAV Date"), errors="coerce", dayfirst=True)
+            if pd.notna(row_date) and (latest_nav_date - row_date).days > 30:
+                skipped_option += 1
+                continue
         option_type = str(row.get("Option Type", "")).strip().lower()
 
         # AMFI reports the plan as "Direct Plan" / "Regular Plan" in the new
@@ -483,7 +524,10 @@ def select_regular_growth_isins(df_matched):
         if (re.search(r"\bplan\s*[b-z]\b", nm)
                 or re.search(r"\beco\b", nm)
                 or re.search(r"\b(institutional|retail|super)\b", nm)
-                or re.search(r"\b(wealth|blended)\s+plan\b", nm)):
+                or re.search(r"\b(wealth|blended)\s+plan\b", nm)
+                # Unclaimed-amount plans and Premium Plus are AMFI-listed
+                # classes of the same scheme, not separate funds.
+                or re.search(r"\bunclaimed\b|\bpremium plus\b", nm)):
             skipped_option += 1
             continue
         # Option is "Growth", "Growth Option", "IDCW" or "Other" depending on
@@ -493,7 +537,9 @@ def select_regular_growth_isins(df_matched):
         # "Other" means the feed states an option that is neither Growth nor
         # IDCW, so it is not a Growth share class and must go. Only a genuinely
         # absent option ("unknown") falls through to the name test above.
-        if option_type and option_type != "unknown" and "growth" not in option_type:
+        # "Cumulative" is ICICI Prudential's name for its Growth option.
+        if (option_type and option_type != "unknown"
+                and "growth" not in option_type and "cumulative" not in option_type):
             skipped_option += 1
             continue
 

@@ -699,7 +699,15 @@ def run_historical_export(
                             is_idcw = ("idcw" in opt) or ("dividend" in opt) or ("payout" in opt)
                         else:
                             is_idcw = is_idcw_scheme(scheme_name)
-                        if is_direct or is_idcw:
+                        # A row whose own ISIN was asked for is kept as it is:
+                        # the caller chose that share class. Re-applying the
+                        # Regular Growth rule here dropped every ETF AMFI labels
+                        # "Direct Plan" (Nippon Gold BeES, Zerodha, HSBC Gold
+                        # ETF) -- an ETF has one unit class, so that label is
+                        # meaningless, and they came back as "no NAV". The rule
+                        # still guards rows reached only through the
+                        # reinvestment ISIN, which belongs to the IDCW option.
+                        if not g_match and (is_direct or is_idcw):
                             continue
 
                         scheme_code = _col("scheme_code")
